@@ -1,0 +1,243 @@
+<mujoco model="crowd_density_fleet_arena">
+    <option timestep="0.005" gravity="0 0 -9.81"/>
+
+    <visual>
+        <headlight ambient="0.35 0.35 0.40" diffuse="0.45 0.45 0.50" specular="0.15 0.15 0.20"/>
+        <rgba haze="0.10 0.12 0.16 1"/>
+        <global offwidth="640" offheight="480"/>
+    </visual>
+
+    <asset>
+        <texture name="grid_tex" type="2d" builtin="checker" rgb1="0.15 0.17 0.22" rgb2="0.20 0.23 0.29" width="512" height="512"/>
+        <material name="floor_mat" texture="grid_tex" texrepeat="12 12" reflectance="0.08"/>
+        <material name="wall_mat" rgba="0.32 0.35 0.42 1"/>
+        <material name="stage_mat" rgba="0.25 0.20 0.38 1"/>
+    </asset>
+
+    <worldbody>
+        <!-- Overhead Ambient Arena Illumination -->
+        <light name="arena_sun" pos="0 0 14" dir="0 0 -1" directional="true" diffuse="0.55 0.55 0.60" specular="0.1 0.1 0.1"/>
+
+        <!-- Ground Plane -->
+        <geom name="floor" type="plane" size="10 10 0.1" material="floor_mat"/>
+
+        <!-- Sector Divider Markings (Non-colliding visual lines on the floor) -->
+        <geom name="sector_center_line" type="box" pos="0 0 0.003" size="0.03 5.5 0.002" contype="0" conaffinity="0" rgba="0.35 0.40 0.50 0.6"/>
+        <geom name="stage_front_zone" type="box" pos="-1.2 0 0.004" size="2.2 2.2 0.002" contype="0" conaffinity="0" rgba="0.30 0.28 0.45 0.45"/>
+
+        <!-- Spectator World Camera (High Third-Person View capturing both drones, crowd, and red beacon projection) -->
+        <camera name="world_cam" pos="-8.8 -7.8 8.6" xyaxes="0.66 -0.75 0.0 0.43 0.38 0.82" fovy="52"/>
+
+        <!-- Festival / Transit Bottleneck Perimeter Walls -->
+        <geom name="wall_north" type="box" pos="0 5.5 0.65" size="6.5 0.18 0.65" material="wall_mat" friction="0.01 0.001 0.0001"/>
+        <geom name="wall_south" type="box" pos="0 -5.5 0.65" size="6.5 0.18 0.65" material="wall_mat" friction="0.01 0.001 0.0001"/>
+        <geom name="wall_east"  type="box" pos="6.5 0 0.65" size="0.18 5.5 0.65" material="wall_mat" friction="0.01 0.001 0.0001"/>
+        <geom name="wall_west"  type="box" pos="-6.5 0 0.65" size="0.18 5.5 0.65" material="wall_mat" friction="0.01 0.001 0.0001"/>
+
+        <!-- Bottleneck Funnel Barriers near West Stage / Gate -->
+        <geom name="funnel_north" type="box" pos="-3.8 3.6 0.55" size="0.25 1.8 0.55" material="stage_mat" friction="0.01 0.001 0.0001"/>
+        <geom name="funnel_south" type="box" pos="-3.8 -3.6 0.55" size="0.25 1.8 0.55" material="stage_mat" friction="0.01 0.001 0.0001"/>
+
+        <!-- Ground Projection Ring for Drone Alpha Beacon (Mocap visual indicator coupled with spotlight) -->
+        <body name="beacon_disc_alpha" mocap="true" pos="-1.5 0.0 -2.0">
+            <geom name="disc_alpha_outer" type="cylinder" size="2.2 0.008" contype="0" conaffinity="0" rgba="1.0 0.05 0.05 0.28"/>
+            <geom name="disc_alpha_inner" type="cylinder" size="1.1 0.010" contype="0" conaffinity="0" rgba="1.0 0.15 0.10 0.42"/>
+        </body>
+
+        <!-- Ground Projection Ring for Drone Bravo Beacon -->
+        <body name="beacon_disc_bravo" mocap="true" pos="2.0 0.0 -2.0">
+            <geom name="disc_bravo_outer" type="cylinder" size="2.2 0.008" contype="0" conaffinity="0" rgba="1.0 0.05 0.05 0.28"/>
+            <geom name="disc_bravo_inner" type="cylinder" size="1.1 0.010" contype="0" conaffinity="0" rgba="1.0 0.15 0.10 0.42"/>
+        </body>
+
+        <!-- ===================================================================== -->
+        <!-- FLEET DRONE 1: DRONE ALPHA (Primary West Sector & Dispersion Responder) -->
+        <!-- ===================================================================== -->
+        <body name="drone_alpha" mocap="true" pos="-1.5 0.0 4.2">
+            <geom name="alpha_core" type="box" size="0.24 0.24 0.065" rgba="0.95 0.78 0.12 1" contype="0" conaffinity="0"/>
+            <geom name="alpha_arm1" type="capsule" fromto="-0.35 -0.35 0 0.35 0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
+            <geom name="alpha_arm2" type="capsule" fromto="-0.35 0.35 0 0.35 -0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
+            <geom name="alpha_r1" type="cylinder" pos="0.35 0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
+            <geom name="alpha_r2" type="cylinder" pos="0.35 -0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
+            <geom name="alpha_r3" type="cylinder" pos="-0.35 0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
+            <geom name="alpha_r4" type="cylinder" pos="-0.35 -0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
+            <!-- Underbelly Beacon Dome & Spotlight Cone (Visual) -->
+            <geom name="alpha_beacon_bulb" type="sphere" pos="0 0 -0.09" size="0.11" rgba="0.2 0.2 0.2 0.5" contype="0" conaffinity="0"/>
+            <geom name="alpha_beam_cone" type="cylinder" pos="0 0 -1.5" size="0.85 1.4" rgba="1.0 0.0 0.0 0.0" contype="0" conaffinity="0"/>
+            <!-- Downward Camera & Spotlight -->
+            <camera name="cam_alpha" pos="0 0 -0.10" xyaxes="1 0 0 0 1 0" fovy="78"/>
+            <light name="light_alpha" mode="fixed" pos="0 0 -0.12" dir="0 0 -1" directional="false" cutoff="42" exponent="8" diffuse="0.05 0.05 0.05" specular="0.0 0.0 0.0"/>
+        </body>
+
+        <!-- ===================================================================== -->
+        <!-- FLEET DRONE 2: DRONE BRAVO (Secondary East Sector & Adaptive Overwatch) -->
+        <!-- ===================================================================== -->
+        <body name="drone_bravo" mocap="true" pos="2.2 0.0 4.2">
+            <geom name="bravo_core" type="box" size="0.24 0.24 0.065" rgba="0.15 0.65 0.95 1" contype="0" conaffinity="0"/>
+            <geom name="bravo_arm1" type="capsule" fromto="-0.35 -0.35 0 0.35 0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
+            <geom name="bravo_arm2" type="capsule" fromto="-0.35 0.35 0 0.35 -0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
+            <geom name="bravo_r1" type="cylinder" pos="0.35 0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
+            <geom name="bravo_r2" type="cylinder" pos="0.35 -0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
+            <geom name="bravo_r3" type="cylinder" pos="-0.35 0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
+            <geom name="bravo_r4" type="cylinder" pos="-0.35 -0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
+            <!-- Underbelly Beacon Dome & Spotlight Cone (Visual) -->
+            <geom name="bravo_beacon_bulb" type="sphere" pos="0 0 -0.09" size="0.11" rgba="0.2 0.2 0.2 0.5" contype="0" conaffinity="0"/>
+            <geom name="bravo_beam_cone" type="cylinder" pos="0 0 -1.5" size="0.85 1.4" rgba="1.0 0.0 0.0 0.0" contype="0" conaffinity="0"/>
+            <!-- Downward Camera & Spotlight -->
+            <camera name="cam_bravo" pos="0 0 -0.10" xyaxes="1 0 0 0 1 0" fovy="78"/>
+            <light name="light_bravo" mode="fixed" pos="0 0 -0.12" dir="0 0 -1" directional="false" cutoff="42" exponent="8" diffuse="0.05 0.05 0.05" specular="0.0 0.0 0.0"/>
+        </body>
+
+        <!-- ===================================================================== -->
+        <!-- DYNAMIC CROWD: 18 PEDESTRIANS WITH 2-DOF SLIDE JOINTS                 -->
+        <!-- ===================================================================== -->
+        <body name="ped_0" pos="0.0 0.0 0.45">
+            <joint name="ped_0_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_0_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_0_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_0_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_1" pos="0.0 0.0 0.45">
+            <joint name="ped_1_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_1_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_1_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_1_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_2" pos="0.0 0.0 0.45">
+            <joint name="ped_2_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_2_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_2_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_2_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_3" pos="0.0 0.0 0.45">
+            <joint name="ped_3_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_3_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_3_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_3_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_4" pos="0.0 0.0 0.45">
+            <joint name="ped_4_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_4_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_4_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_4_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_5" pos="0.0 0.0 0.45">
+            <joint name="ped_5_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_5_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_5_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_5_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_6" pos="0.0 0.0 0.45">
+            <joint name="ped_6_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_6_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_6_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_6_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_7" pos="0.0 0.0 0.45">
+            <joint name="ped_7_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_7_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_7_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_7_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_8" pos="0.0 0.0 0.45">
+            <joint name="ped_8_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_8_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_8_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_8_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_9" pos="0.0 0.0 0.45">
+            <joint name="ped_9_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_9_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_9_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_9_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_10" pos="0.0 0.0 0.45">
+            <joint name="ped_10_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_10_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_10_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_10_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_11" pos="0.0 0.0 0.45">
+            <joint name="ped_11_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_11_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_11_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_11_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_12" pos="0.0 0.0 0.45">
+            <joint name="ped_12_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_12_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_12_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_12_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_13" pos="0.0 0.0 0.45">
+            <joint name="ped_13_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_13_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_13_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_13_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_14" pos="0.0 0.0 0.45">
+            <joint name="ped_14_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_14_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_14_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_14_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_15" pos="0.0 0.0 0.45">
+            <joint name="ped_15_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_15_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_15_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_15_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_16" pos="0.0 0.0 0.45">
+            <joint name="ped_16_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_16_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_16_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_16_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+        <body name="ped_17" pos="0.0 0.0 0.45">
+            <joint name="ped_17_jx" type="slide" axis="1 0 0" damping="12.0"/>
+            <joint name="ped_17_jy" type="slide" axis="0 1 0" damping="12.0"/>
+            <geom name="ped_17_geom" type="cylinder" size="0.22 0.40" rgba="0.0 0.95 0.95 1" mass="65.0" friction="0.04 0.005 0.0001"/>
+            <geom name="ped_17_head" type="sphere" pos="0 0 0.50" size="0.15" rgba="0.0 0.85 0.85 1" mass="5.0"/>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <!-- Velocity/Force Actuators for 18 Pedestrians (2-DOF each = 36 actuators) -->
+        <motor name="act_ped_0_x"  joint="ped_0_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_0_y"  joint="ped_0_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_1_x"  joint="ped_1_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_1_y"  joint="ped_1_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_2_x"  joint="ped_2_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_2_y"  joint="ped_2_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_3_x"  joint="ped_3_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_3_y"  joint="ped_3_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_4_x"  joint="ped_4_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_4_y"  joint="ped_4_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_5_x"  joint="ped_5_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_5_y"  joint="ped_5_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_6_x"  joint="ped_6_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_6_y"  joint="ped_6_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_7_x"  joint="ped_7_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_7_y"  joint="ped_7_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_8_x"  joint="ped_8_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_8_y"  joint="ped_8_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_9_x"  joint="ped_9_jx"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_9_y"  joint="ped_9_jy"  gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_10_x" joint="ped_10_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_10_y" joint="ped_10_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_11_x" joint="ped_11_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_11_y" joint="ped_11_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_12_x" joint="ped_12_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_12_y" joint="ped_12_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_13_x" joint="ped_13_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_13_y" joint="ped_13_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_14_x" joint="ped_14_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_14_y" joint="ped_14_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_15_x" joint="ped_15_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_15_y" joint="ped_15_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_16_x" joint="ped_16_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_16_y" joint="ped_16_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_17_x" joint="ped_17_jx" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+        <motor name="act_ped_17_y" joint="ped_17_jy" gear="65" ctrlrange="-3.5 3.5" ctrllimited="true"/>
+    </actuator>
+</mujoco>
