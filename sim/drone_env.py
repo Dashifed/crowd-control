@@ -56,13 +56,12 @@ class CrowdFleetEnv:
         self.rng = np.random.default_rng(seed)
 
         # --- Drones, spotlights, ground rings ---
-        self.drone_mocap, self.disc_mocap, self.light_id, self.bulb_geom = {}, {}, {}, {}
+        self.drone_mocap, self.disc_mocap, self.bulb_geom = {}, {}, {}
         for d in self.DRONES:
             body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"drone_{d}")
             disc = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"beacon_disc_{d}")
             self.drone_mocap[d] = self.model.body_mocapid[body]
             self.disc_mocap[d] = self.model.body_mocapid[disc]
-            self.light_id[d] = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_LIGHT, f"light_{d}")
             self.bulb_geom[d] = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{d}_beacon_bulb")
         self.beacon_active = {d: False for d in self.DRONES}
 
@@ -132,13 +131,9 @@ class CrowdFleetEnv:
         """Turns a drone's red spotlight and its ground ring on/off (informational only)."""
         d = drone_id.lower()
         self.beacon_active[d] = bool(active)
-        lid, bulb = self.light_id[d], self.bulb_geom[d]
-        if active:
-            self.model.light_diffuse[lid] = [0.9, 0.05, 0.05]
-            self.model.geom_rgba[bulb] = [1.0, 0.0, 0.0, 1.0]
-        else:
-            self.model.light_diffuse[lid] = [0.0, 0.0, 0.0]
-            self.model.geom_rgba[bulb] = [0.2, 0.2, 0.2, 0.5]
+        bulb = self.bulb_geom[d]
+        # Shown as a red bulb on the drone and a red ring on the floor (see generate_arena.py)
+        self.model.geom_rgba[bulb] = [1.0, 0.0, 0.0, 1.0] if active else [0.2, 0.2, 0.2, 0.5]
         self._place_disc(d)
 
     def _place_disc(self, d):

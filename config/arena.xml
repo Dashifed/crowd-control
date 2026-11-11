@@ -11,18 +11,22 @@
 
     <asset>
         <texture name="grid_tex" type="2d" builtin="checker" rgb1="0.15 0.17 0.22" rgb2="0.19 0.22 0.27" width="512" height="512"/>
-        <material name="floor_mat" texture="grid_tex" texrepeat="10 8" reflectance="0.05"/>
+        <material name="floor_mat" texture="grid_tex" texrepeat="10 8" reflectance="0"/>
         <material name="wall_mat" rgba="0.32 0.35 0.42 1"/>
         <material name="stage_mat" rgba="0.25 0.20 0.38 1"/>
         <material name="barrier_mat" rgba="0.55 0.55 0.58 1"/>
         <material name="bar_mat" rgba="0.40 0.28 0.18 1"/>
+        <material name="alpha_body_mat" rgba="1.0 0.80 0.10 1" emission="0.9"/>
+        <material name="alpha_rotor_mat" rgba="0.2 1.0 0.4 0.85" emission="0.8"/>
+        <material name="bravo_body_mat" rgba="0.15 0.65 1.0 1" emission="0.9"/>
+        <material name="bravo_rotor_mat" rgba="0.3 0.9 1.0 0.85" emission="0.8"/>
     </asset>
 
     <worldbody>
         <light name="arena_sun" pos="0 0 14" dir="0 0 -1" directional="true" castshadow="false" diffuse="0.50 0.50 0.55" specular="0.1 0.1 0.1"/>
         <geom name="floor" type="plane" size="11.0 8.5 0.1" material="floor_mat"/>
 
-        <camera name="world_cam" pos="3.0 -19.0 15.0" xyaxes="0.9796 0.2009 -0.0000 -0.1209 0.5895 0.7986" fovy="50"/>
+        <camera name="world_cam" pos="3.0 -21.0 15.0" xyaxes="0.9846 0.1750 -0.0000 -0.0855 0.4811 0.8725" fovy="54"/>
 
         <!-- Perimeter walls -->
         <geom name="wall_north" type="box" pos="0 7.7 1.5" size="10.4 0.2 1.5" material="wall_mat"/>
@@ -38,36 +42,34 @@
         <geom name="bar" type="box" pos="9.5 0 0.55" size="0.5 3.0 0.55" material="bar_mat"/>
 
         <body name="drone_alpha" mocap="true" pos="-5 0 7">
-            <geom name="alpha_core" type="box" size="0.24 0.24 0.065" rgba="0.95 0.78 0.12 1" contype="0" conaffinity="0"/>
-            <geom name="alpha_arm1" type="capsule" fromto="-0.35 -0.35 0 0.35 0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
-            <geom name="alpha_arm2" type="capsule" fromto="-0.35 0.35 0 0.35 -0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
-            <geom name="alpha_r1" type="cylinder" pos="0.35 0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
-            <geom name="alpha_r2" type="cylinder" pos="0.35 -0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
-            <geom name="alpha_r3" type="cylinder" pos="-0.35 0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
-            <geom name="alpha_r4" type="cylinder" pos="-0.35 -0.35 0.05" size="0.17 0.012" rgba="0.1 0.95 0.35 0.8" contype="0" conaffinity="0"/>
+            <geom name="alpha_core" type="box" size="0.42 0.42 0.10" material="alpha_body_mat" contype="0" conaffinity="0"/>
+            <geom name="alpha_arm1" type="capsule" fromto="-0.65 -0.65 0 0.65 0.65 0" size="0.05" material="alpha_body_mat" contype="0" conaffinity="0"/>
+            <geom name="alpha_arm2" type="capsule" fromto="-0.65 0.65 0 0.65 -0.65 0" size="0.05" material="alpha_body_mat" contype="0" conaffinity="0"/>
+            <geom name="alpha_r1" type="cylinder" pos="0.65 0.65 0.06" size="0.30 0.015" material="alpha_rotor_mat" contype="0" conaffinity="0"/>
+            <geom name="alpha_r2" type="cylinder" pos="0.65 -0.65 0.06" size="0.30 0.015" material="alpha_rotor_mat" contype="0" conaffinity="0"/>
+            <geom name="alpha_r3" type="cylinder" pos="-0.65 0.65 0.06" size="0.30 0.015" material="alpha_rotor_mat" contype="0" conaffinity="0"/>
+            <geom name="alpha_r4" type="cylinder" pos="-0.65 -0.65 0.06" size="0.30 0.015" material="alpha_rotor_mat" contype="0" conaffinity="0"/>
             <geom name="alpha_beacon_bulb" type="sphere" pos="0 0 -0.09" size="0.11" rgba="0.2 0.2 0.2 0.5" contype="0" conaffinity="0"/>
             <camera name="cam_alpha" pos="0 0 -0.10" xyaxes="1 0 0 0 1 0" fovy="78"/>
-            <light name="light_alpha" mode="fixed" pos="0 0 -0.12" dir="0 0 -1" directional="false" castshadow="false" cutoff="30" exponent="6" diffuse="0 0 0" specular="0 0 0"/>
         </body>
         <body name="beacon_disc_alpha" mocap="true" pos="0 0 -2.0">
-            <geom name="disc_alpha_outer" type="cylinder" size="2.0 0.008" contype="0" conaffinity="0" rgba="1.0 0.05 0.05 0.22"/>
-            <geom name="disc_alpha_inner" type="cylinder" size="1.0 0.010" contype="0" conaffinity="0" rgba="1.0 0.15 0.10 0.30"/>
+            <geom name="disc_alpha_outer" type="cylinder" size="2.0 0.008" contype="0" conaffinity="0" rgba="1.0 0.05 0.05 0.30"/>
+            <geom name="disc_alpha_inner" type="cylinder" size="1.0 0.010" contype="0" conaffinity="0" rgba="1.0 0.15 0.10 0.40"/>
         </body>
         <body name="drone_bravo" mocap="true" pos="5 0 7">
-            <geom name="bravo_core" type="box" size="0.24 0.24 0.065" rgba="0.15 0.65 0.95 1" contype="0" conaffinity="0"/>
-            <geom name="bravo_arm1" type="capsule" fromto="-0.35 -0.35 0 0.35 0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
-            <geom name="bravo_arm2" type="capsule" fromto="-0.35 0.35 0 0.35 -0.35 0" size="0.026" rgba="0.18 0.18 0.20 1" contype="0" conaffinity="0"/>
-            <geom name="bravo_r1" type="cylinder" pos="0.35 0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
-            <geom name="bravo_r2" type="cylinder" pos="0.35 -0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
-            <geom name="bravo_r3" type="cylinder" pos="-0.35 0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
-            <geom name="bravo_r4" type="cylinder" pos="-0.35 -0.35 0.05" size="0.17 0.012" rgba="0.2 0.85 1.0 0.8" contype="0" conaffinity="0"/>
+            <geom name="bravo_core" type="box" size="0.42 0.42 0.10" material="bravo_body_mat" contype="0" conaffinity="0"/>
+            <geom name="bravo_arm1" type="capsule" fromto="-0.65 -0.65 0 0.65 0.65 0" size="0.05" material="bravo_body_mat" contype="0" conaffinity="0"/>
+            <geom name="bravo_arm2" type="capsule" fromto="-0.65 0.65 0 0.65 -0.65 0" size="0.05" material="bravo_body_mat" contype="0" conaffinity="0"/>
+            <geom name="bravo_r1" type="cylinder" pos="0.65 0.65 0.06" size="0.30 0.015" material="bravo_rotor_mat" contype="0" conaffinity="0"/>
+            <geom name="bravo_r2" type="cylinder" pos="0.65 -0.65 0.06" size="0.30 0.015" material="bravo_rotor_mat" contype="0" conaffinity="0"/>
+            <geom name="bravo_r3" type="cylinder" pos="-0.65 0.65 0.06" size="0.30 0.015" material="bravo_rotor_mat" contype="0" conaffinity="0"/>
+            <geom name="bravo_r4" type="cylinder" pos="-0.65 -0.65 0.06" size="0.30 0.015" material="bravo_rotor_mat" contype="0" conaffinity="0"/>
             <geom name="bravo_beacon_bulb" type="sphere" pos="0 0 -0.09" size="0.11" rgba="0.2 0.2 0.2 0.5" contype="0" conaffinity="0"/>
             <camera name="cam_bravo" pos="0 0 -0.10" xyaxes="1 0 0 0 1 0" fovy="78"/>
-            <light name="light_bravo" mode="fixed" pos="0 0 -0.12" dir="0 0 -1" directional="false" castshadow="false" cutoff="30" exponent="6" diffuse="0 0 0" specular="0 0 0"/>
         </body>
         <body name="beacon_disc_bravo" mocap="true" pos="0 0 -2.0">
-            <geom name="disc_bravo_outer" type="cylinder" size="2.0 0.008" contype="0" conaffinity="0" rgba="1.0 0.05 0.05 0.22"/>
-            <geom name="disc_bravo_inner" type="cylinder" size="1.0 0.010" contype="0" conaffinity="0" rgba="1.0 0.15 0.10 0.30"/>
+            <geom name="disc_bravo_outer" type="cylinder" size="2.0 0.008" contype="0" conaffinity="0" rgba="1.0 0.05 0.05 0.30"/>
+            <geom name="disc_bravo_inner" type="cylinder" size="1.0 0.010" contype="0" conaffinity="0" rgba="1.0 0.15 0.10 0.40"/>
         </body>
 
         <body name="ped_0" pos="0 0 0.45">
