@@ -1,275 +1,282 @@
 #!/usr/bin/env python3
 """
-Main Orchestrator for Autonomous Crowd-Density Dispersion & Coordinated Fleet.
-Runs a 60-second closed-loop simulation at 30 FPS:
-  - Initializes CrowdFleetEnv, DensityPerceptionEngine, and FleetCoordinator.
-  - Triggers unscripted crowd crush surges at t = 12s (and a second wave at t = 34s)
-    so the drone's autonomous descent, red beacon projection, crowd dispersion,
-    fleet blind-spot adaptation, and failsafe climb are demonstrated in one continuous take.
-  - Exports side-by-side `world_cam` + `cam_alpha` video to `submission_video.mp4`.
-  - Prints the NVIDIA Jetson Orin Nano Edge Latency Benchmark Table.
+CrowdFlow - stage-front scenario, 100 people, 2 drones (MuJoCo).
+
+Closed loop, every 0.1 s:
+    drone cameras -> head detection -> tracking -> (1 Hz) fleet crowd map + score C
+    -> fleet coordinator (patrol / respond / escalation ladder) -> drone moves, spotlight,
+    announcements -> people react (or not) -> cameras see the result.
+
+Nothing is timed: congestion emerges as fans decide to move to the stage.
+The drones only ever use camera-derived data. Ground truth is used once per second
+for the evaluation summary at the end, never by the drones.
+
+Usage:
+    python run_simulation.py                    # 90 s run, 30 FPS video
+    python run_simulation.py --fps 10           # faster rendering
+    python run_simulation.py --no-interventions # baseline: drones watch but never act
+    python run_simulation.py --camera-fault     # inject a camera fault at 70-74 s
 """
 
+import argparse
+import json
 import os
 import time
 import numpy as np
 import cv2
 
-from sim.drone_env import CrowdFleetEnv
+from sim.drone_env import CrowdFleetEnv, SPOTLIGHT_RADIUS, VENUE_X, VENUE_Y, BARRIER_X
 from perception.density_detector import DensityPerceptionEngine
-from brain.fleet_planner import FleetCoordinator
+from perception.tracker import MultiTracker
+from perception.zone_analytics import FleetCrowdMap, STATUS_NAMES
+from brain.fleet_planner import FleetCoordinator, LADDER
 
-# =====================================================================
-# SIMULATION & VIDEO PARAMETERS
-# =====================================================================
-SIM_DURATION = 60.0          # 60-second competition deliverable video
-FPS = 30                     # 30 frames per second
-FRAME_W = 640                # Width per camera viewport
-FRAME_H = 480                # Height per camera viewport
-
-# Event Timeline (Seconds)
-SURGE_1_START = 12.0         # Required t = 12s unscripted crowd surge
-SURGE_2_START = 32.0         # Second crowd surge wave to showcase repeatability
-FAILSAFE_TEST_START = 48.0   # Brief simulated vision degradation -> 7.0m ceiling climb
-FAILSAFE_TEST_END = 52.5
+FRAME_W, FRAME_H = 640, 480
+PANEL_H = 230
+CONTROL_HZ = 10
+STATUS_BGR = {None: (90, 90, 90), 0: (80, 170, 80), 1: (40, 200, 230), 2: (30, 130, 255), 3: (40, 40, 230)}
 
 
-def annotate_world_cam(world_rgb: np.ndarray, sim_time: float, fleet_decision: dict,
-                       alpha_metrics: dict, bravo_metrics: dict, surge_active: bool) -> np.ndarray:
-    """Draws clean spectator telemetry on the left (`world_cam`) video pane."""
-    bgr = cv2.cvtColor(world_rgb, cv2.COLOR_RGB2BGR)
+# ---------------------------------------------------------------------- drawing
+def put(img, text, org, scale=0.45, color=(235, 235, 240), thick=1):
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
-    # Top Header Bar
-    cv2.rectangle(bgr, (0, 0), (FRAME_W, 74), (18, 20, 26), -1)
-    cv2.putText(
-        bgr,
-        f"SPECTATOR WORLD CAM | T = {sim_time:05.2f}s / {SIM_DURATION:.0f}s",
-        (14, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.58,
-        (240, 240, 245),
-        2,
-        cv2.LINE_AA,
-    )
 
-    fleet_mode = fleet_decision["fleet_mode"]
-    if fleet_mode == "DISPERSION_INTERVENTION":
-        status_str = "FLEET ALERT: ALPHA DISPERSING SURGE (3.0m) | BRAVO CENTER OVERWATCH"
-        status_col = (50, 50, 255)
-    elif fleet_mode == "FAILSAFE":
-        status_str = "SAFETY FAILSAFE: SENSOR DROPOUT -> CLIMBING TO 7.0M CEILING HOLD"
-        status_col = (0, 165, 255)
-    elif fleet_mode == "RECOVERY":
-        status_str = "RECOVERY: DENSITY RESTORED -> RETURNING TO SPLIT-SECTOR PATROL"
-        status_col = (255, 220, 80)
-    else:
-        status_str = "FLEET NOMINAL: ALPHA (SECTOR 1) & BRAVO (SECTOR 2) PATROL (4.2m)"
-        status_col = (80, 240, 120)
-
-    cv2.putText(bgr, status_str, (14, 54),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.46, status_col, 2, cv2.LINE_AA)
-
-    # Bottom Telemetry Bar
-    cv2.rectangle(bgr, (0, FRAME_H - 60), (FRAME_W, FRAME_H), (18, 20, 26), -1)
-    alpha_pos = fleet_decision["alpha_pos"]
-    bravo_pos = fleet_decision["bravo_pos"]
-    beacon_txt = "ACTIVE (RED BEAM ON)" if fleet_decision["alpha_beacon"] else "STANDBY (OFF)"
-    beacon_col = (50, 50, 255) if fleet_decision["alpha_beacon"] else (160, 170, 185)
-
-    cv2.putText(
-        bgr,
-        f"ALPHA: ({alpha_pos[0]:+.1f}, {alpha_pos[1]:+.1f}, {alpha_pos[2]:.1f}m) [{fleet_decision['alpha_state']}]",
-        (14, FRAME_H - 36),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.44,
-        (80, 215, 255),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        bgr,
-        f"BRAVO: ({bravo_pos[0]:+.1f}, {bravo_pos[1]:+.1f}, {bravo_pos[2]:.1f}m) [{fleet_decision['bravo_state']}] | "
-        f"BEACON: {beacon_txt}",
-        (14, FRAME_H - 12),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
-        beacon_col,
-        1,
-        cv2.LINE_AA,
-    )
-
-    # Vertical separator line between left and right panes
-    cv2.line(bgr, (FRAME_W - 1, 0), (FRAME_W - 1, FRAME_H), (110, 115, 125), 2)
+def draw_world_pane(rgb, t, duration, coordinator, enabled, last_announcement):
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    if last_announcement is not None and t - last_announcement[0] < 6.0:
+        cv2.rectangle(bgr, (0, FRAME_H - 34), (FRAME_W, FRAME_H), (30, 110, 200), -1)
+        put(bgr, f"DRONE ANNOUNCEMENT: {last_announcement[1]}", (10, FRAME_H - 12), 0.45, thick=1)
+    cv2.rectangle(bgr, (0, 0), (FRAME_W, 50), (18, 20, 26), -1)
+    put(bgr, f"CROWDFLOW SIMULATION | t = {t:5.1f}s / {duration:.0f}s", (12, 20), 0.55, thick=2)
+    mode = "INTERVENTIONS ON" if enabled else "BASELINE: INTERVENTIONS OFF"
+    put(bgr, f"Alpha: {coordinator.state['alpha']}   Bravo: {coordinator.state['bravo']}   [{mode}]",
+        (12, 42), 0.43, (170, 220, 255))
     return bgr
 
 
+def draw_drone_pane(perc, tracks, drone, pos, state, detector, crowd_map, t, beacon):
+    img = perc["bgr"].copy()
+    for tr in tracks:
+        u, v = detector.world_to_pixel(tr.pos, pos)
+        col = (60, 220, 60) if tr.speed > 0.3 else (0, 200, 255) if tr.slow_updates < 3 else (60, 60, 255)
+        cv2.circle(img, (u, v), 6, col, 2)
+    worst = crowd_map.worst_zone(t, fresh_only=False)
+    if worst is not None and worst.status >= 1:
+        x0, x1, y0, y1 = worst.rect
+        p0 = detector.world_to_pixel((x0, y1), pos)
+        p1 = detector.world_to_pixel((x1, y0), pos)
+        cv2.rectangle(img, p0, p1, STATUS_BGR[worst.status], 2)
+        put(img, f"{STATUS_NAMES[worst.status]} C={worst.score:.0f}", (p0[0], max(14, p0[1] - 6)),
+            0.45, STATUS_BGR[worst.status], 2)
+    cv2.rectangle(img, (0, 0), (FRAME_W, 50), (18, 20, 26), -1)
+    put(img, f"DRONE {drone.upper()} CAMERA | z={pos[2]:.1f}m | {state}", (12, 20), 0.55, thick=2)
+    put(img, f"heads detected: {len(perc['detections'])}  tracks: {len(tracks)}  "
+             f"cam health: {perc['vision_confidence']:.2f}  spotlight: {'ON' if beacon else 'off'}",
+        (12, 42), 0.42, (190, 200, 210))
+    put(img, "circles: green moving / amber slow / red stopped", (12, FRAME_H - 10), 0.4, (200, 200, 200))
+    return img
+
+
+def draw_panel(crowd_map, coordinator, t, drone_pos, beacon):
+    panel = np.full((PANEL_H, FRAME_W * 2, 3), (22, 24, 30), np.uint8)
+
+    # --- fleet crowd map (left) ---
+    s = 13.0
+    ox, oy = 14, 18
+    to_px = lambda x, y: (int(ox + (x + VENUE_X) * s), int(oy + (VENUE_Y - y) * s))
+    put(panel, "FLEET CROWD MAP (camera-derived)", (ox, 13), 0.42, (200, 200, 210))
+    cv2.rectangle(panel, to_px(-VENUE_X, VENUE_Y), to_px(VENUE_X, -VENUE_Y), (70, 70, 80), 1)
+    cv2.rectangle(panel, to_px(-VENUE_X, 5.5), to_px(BARRIER_X, -5.5), (90, 60, 80), -1)
+    put(panel, "STAGE", (to_px(-VENUE_X, 0)[0] + 1, to_px(0, 0)[1]), 0.3, (220, 200, 230))
+    for z in crowd_map.zones:                       # 1 m cells coloured by the zone centred there
+        fresh = crowd_map.freshness(z, t)
+        col = STATUS_BGR[z.status] if fresh != "unknown" else STATUS_BGR[None]
+        if fresh == "stale":
+            col = tuple(int(c * 0.55) for c in col)
+        p0, p1 = to_px(z.c[0] - 0.5, z.c[1] + 0.5), to_px(z.c[0] + 0.5, z.c[1] - 0.5)
+        cv2.rectangle(panel, p0, (p1[0] - 1, p1[1] - 1), col, -1)
+    for d, colr in (("alpha", (40, 200, 245)), ("bravo", (245, 165, 40))):
+        p = to_px(*drone_pos[d][:2])
+        if beacon[d]:
+            cv2.circle(panel, p, int(SPOTLIGHT_RADIUS * s), (40, 40, 255), 1)
+        cv2.circle(panel, p, 5, colr, -1)
+        put(panel, d[0].upper(), (p[0] + 6, p[1] - 4), 0.4, colr, 1)
+    legend_y = oy + int(2 * VENUE_Y * s) + 14
+    for k, (name, col) in enumerate([("normal", 0), ("developing", 1), ("high", 2), ("critical", 3),
+                                     ("unknown", None)]):
+        x = ox + k * 54
+        cv2.rectangle(panel, (x, legend_y - 8), (x + 8, legend_y), STATUS_BGR[col], -1)
+        put(panel, name, (x + 11, legend_y), 0.3, (200, 200, 200))
+    put(panel, f"coverage {crowd_map.coverage(t) * 100:.0f}%", (ox + 200, 13), 0.38, (170, 170, 180))
+
+    # --- escalation ladder + metrics (middle) ---
+    mx = 300
+    put(panel, "ESCALATION LADDER", (mx, 18), 0.45, (200, 200, 210))
+    inc = coordinator.incident
+    level = inc["level"] if inc else -1
+    for k, name in enumerate(LADDER):
+        y = 34 + k * 30
+        active = k <= level
+        col = (40, 40, 230) if (k == 3 and active) else (30, 160, 255) if active else (70, 72, 80)
+        cv2.rectangle(panel, (mx, y), (mx + 160, y + 24), col, -1 if active else 1)
+        put(panel, f"{k}  {name}", (mx + 8, y + 17), 0.45, (255, 255, 255) if active else (150, 150, 160))
+    z = inc.get("zone") if inc else crowd_map.worst_zone(t)
+    if z is not None and z.status is not None:
+        fmt = lambda v, f: "n/a" if v is None else f.format(v)
+        lines = [f"zone ({z.c[0]:+.0f},{z.c[1]:+.0f}) {STATUS_NAMES[z.status]}  C={z.score:.0f}",
+                 f"density {z.rho:.2f} p/m2   growth {fmt(z.growth, '{:+.2f}')} /min",
+                 f"speed {fmt(z.speed, '{:.2f}')} m/s   stopped {fmt(z.p_stop, '{:.0%}')}",
+                 f"data: {crowd_map.freshness(z, t)}"]
+        for k, line in enumerate(lines):
+            put(panel, line, (mx + 175, 44 + k * 22), 0.4, (210, 210, 220))
+    if inc is None:
+        put(panel, "no active incident", (mx + 175, 44), 0.42, (130, 200, 130))
+
+    # --- security banner + event log (right) ---
+    ex = 760
+    if coordinator.security_alert:
+        cv2.rectangle(panel, (ex, 6), (FRAME_W * 2 - 10, 34), (30, 30, 200), -1)
+        put(panel, "SECURITY TEAM NOTIFIED - assistance requested at stage front", (ex + 8, 26), 0.45,
+            (255, 255, 255), 1)
+    put(panel, "OPERATOR LOG", (ex, 54), 0.45, (200, 200, 210))
+    for k, (et, text) in enumerate(coordinator.events[-7:]):
+        put(panel, f"{et:5.1f}s {text[:84]}", (ex, 74 + k * 21), 0.33, (210, 210, 220))
+    return panel
+
+
+# ---------------------------------------------------------------------- main loop
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    video_out_path = os.path.join(base_dir, "submission_video.mp4")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--duration", type=float, default=90.0)
+    ap.add_argument("--fps", type=int, default=30, help="video FPS (multiple of 10)")
+    ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--no-interventions", action="store_true", help="baseline: observe only")
+    ap.add_argument("--camera-fault", action="store_true", help="inject Alpha camera fault 70-74 s")
+    ap.add_argument("--out", default="submission_video.mp4")
+    ap.add_argument("--summary", default="run_summary.json")
+    args = ap.parse_args()
+    assert args.fps % CONTROL_HZ == 0, "--fps must be a multiple of 10"
 
-    print("=" * 78)
-    print("  AGENTVERSE ROBOTICS TRACK: CROWD-DENSITY DISPERSION & COORDINATED FLEET")
-    print("=" * 78)
-    print("[1/4] Loading `config/arena.xml` and initializing CrowdFleetEnv...")
+    base = os.path.dirname(os.path.abspath(__file__))
+    env = CrowdFleetEnv(frame_width=FRAME_W, frame_height=FRAME_H, seed=args.seed)
+    detector = DensityPerceptionEngine(FRAME_W, FRAME_H)
+    trackers = {"alpha": MultiTracker(), "bravo": MultiTracker()}
+    crowd_map = FleetCrowdMap()
+    coordinator = FleetCoordinator(interventions_enabled=not args.no_interventions)
 
-    env = CrowdFleetEnv(frame_width=FRAME_W, frame_height=FRAME_H)
-    detector = DensityPerceptionEngine(frame_width=FRAME_W, frame_height=FRAME_H, density_threshold=8)
-    coordinator = FleetCoordinator()
+    video_path = os.path.join(base, args.out)
+    writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
+                             (FRAME_W * 2, FRAME_H + PANEL_H))
+    frames_per_tick = args.fps // CONTROL_HZ
+    steps_per_tick = int(round(1.0 / CONTROL_HZ / env.sim_dt))
+    sub = steps_per_tick // frames_per_tick
+    dt = 1.0 / CONTROL_HZ
+    n_ticks = int(args.duration * CONTROL_HZ)
 
-    steps_per_frame = max(1, int(round((1.0 / FPS) / env.sim_dt)))
-    total_frames = int(SIM_DURATION * FPS)
+    lat = {"perception": [], "tracking": [], "analytics": [], "brain": []}
+    timeline = []
+    last_announcement = None
+    wall0 = time.perf_counter()
+    print(f"Running {args.duration:.0f}s, {env.num_pedestrians} people, "
+          f"interventions {'OFF' if args.no_interventions else 'ON'} ...")
 
-    print("[2/4] Initializing OpenCV MP4 VideoWriter (1280x480 @ 30 FPS)...")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(video_out_path, fourcc, FPS, (FRAME_W * 2, FRAME_H))
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open VideoWriter at: {video_out_path}")
+    for tick in range(n_ticks):
+        t = env.data.time
 
-    # Latency Profiling Accumulators (in milliseconds)
-    perception_latencies = []
-    brain_latencies = []
-    actuation_latencies = []
-    total_loop_latencies = []
+        # 1. Perception (each drone's own camera)
+        percepts, tracks, cam_ok = {}, {}, {}
+        tp = 0.0
+        for d in ("alpha", "bravo"):
+            rgb = env.render_camera(f"cam_{d}")
+            fault = args.camera_fault and d == "alpha" and 70.0 <= t <= 74.0
+            percepts[d] = detector.analyze_frame(rgb, coordinator.pos[d], simulate_dropout=fault)
+            tp += percepts[d]["latency_ms"]
+            cam_ok[d] = percepts[d]["vision_confidence"] >= 0.5
+            t0 = time.perf_counter()
+            tracks[d] = trackers[d].update(percepts[d]["detections"], t, percepts[d]["footprint"]) \
+                if cam_ok[d] else []
+            lat["tracking"].append((time.perf_counter() - t0) * 1000.0)
+        lat["perception"].append(tp)
 
-    surge_1_triggered = False
-    surge_2_triggered = False
+        # 2. Fleet crowd map at 1 Hz
+        if tick % CONTROL_HZ == 0:
+            t0 = time.perf_counter()
+            crowd_map.update(t, [{"drone": d, "xy": coordinator.pos[d][:2],
+                                  "footprint": percepts[d]["footprint"], "tracks": tracks[d]}
+                                 for d in ("alpha", "bravo") if cam_ok[d]])
+            lat["analytics"].append((time.perf_counter() - t0) * 1000.0)
 
-    print(f"[3/4] Running {SIM_DURATION:.0f}s closed-loop simulation ({total_frames} frames)...")
-    wall_t0 = time.perf_counter()
+        # 3. Decide
+        n_events = len(coordinator.events)
+        out = coordinator.update(crowd_map, cam_ok, t, dt)
+        lat["brain"].append(out["brain_ms"])
+        for et, text in coordinator.events[n_events:]:
+            print(f"  [{et:5.1f}s] {text}")
 
-    for frame_idx in range(total_frames):
-        sim_time = frame_idx / FPS
+        # 4. Act
+        for d in ("alpha", "bravo"):
+            env.set_beacon(d, coordinator.beacon[d])
+        ann = coordinator.pending_announcement
+        if ann is not None:
+            n = env.announce(ann["drone"], ann["hotspot"], ann["relief"])
+            last_announcement = (t, "please make space at the front - move to the sides"
+                                 if len(ann["relief"]) else "please stop pushing forward")
+            coordinator.log(t, f"{n} people chose to follow the announcement")
+            print(f"  [{t:5.1f}s] {coordinator.events[-1][1]}")
 
-        # --- Event 1: Trigger Unscripted Crowd Surge at t = 12.0s ---
-        if sim_time >= SURGE_1_START and not surge_1_triggered:
-            env.trigger_surge(True)
-            surge_1_triggered = True
-            print(f"  [EVENT t={sim_time:5.1f}s] Unscripted Crowd Surge #1 triggered in Sector 1!")
+        # 5. Physics + video frames
+        show = coordinator.incident["responder"] if coordinator.incident else "alpha"
+        drone_img = draw_drone_pane(percepts[show], tracks[show], show, coordinator.pos[show],
+                                    coordinator.state[show], detector, crowd_map, t,
+                                    coordinator.beacon[show])
+        panel = draw_panel(crowd_map, coordinator, t, coordinator.pos, coordinator.beacon)
+        for f in range(frames_per_tick):
+            env.step(coordinator.pos, substeps=sub)
+            world = draw_world_pane(env.render_camera("world_cam"), env.data.time, args.duration,
+                                    coordinator, not args.no_interventions, last_announcement)
+            writer.write(np.vstack([np.hstack([world, drone_img]), panel]))
+        leftover = steps_per_tick - sub * frames_per_tick
+        if leftover:
+            env.step(coordinator.pos, substeps=leftover)
 
-        # Once Drone Alpha has actively dispersed the surge for ~4.2s (or enters RECOVERY),
-        # release the surge attraction so the crowd scatters cleanly back to nominal patrol
-        if env.surge_active and (
-            (coordinator.alpha_beacon and (sim_time - coordinator.intervention_start_time) >= 4.2)
-            or coordinator.alpha_state == "RECOVERY"
-        ):
-            env.trigger_surge(False)
-            print(f"  [DISPERSION t={sim_time:5.1f}s] Red warning beacon broke up the crowd crush! Dispersing...")
-
-        # --- Event 2: Secondary Crowd Surge at t = 32.0s ---
-        if sim_time >= SURGE_2_START and not surge_2_triggered:
-            env.trigger_surge(True)
-            surge_2_triggered = True
-            print(f"  [EVENT t={sim_time:5.1f}s] Unscripted Crowd Surge #2 triggered in Sector 1!")
-
-        # =================================================================
-        # ONBOARD AUTONOMOUS EDGE LOOP (PERCEPTION -> BRAIN -> ACTUATION)
-        # =================================================================
-        loop_t0 = time.perf_counter()
-
-        # 1. Onboard Downward Camera Capture & Density Perception (Alpha + Bravo)
-        t_p0 = time.perf_counter()
-        alpha_rgb = env.render_camera("cam_alpha")
-        bravo_rgb = env.render_camera("cam_bravo")
-
-        simulate_glitch = (FAILSAFE_TEST_START <= sim_time <= FAILSAFE_TEST_END)
-        alpha_metrics = detector.analyze_frame(
-            alpha_rgb,
-            drone_pos=coordinator.alpha_pos,
-            drone_label="DRONE ALPHA (SECTOR 1)",
-            fleet_status_text=coordinator.alpha_state,
-            simulate_dropout=simulate_glitch,
-        )
-        bravo_metrics = detector.analyze_frame(
-            bravo_rgb,
-            drone_pos=coordinator.bravo_pos,
-            drone_label="DRONE BRAVO (SECTOR 2)",
-            fleet_status_text=coordinator.bravo_state,
-            simulate_dropout=False,
-        )
-        t_p1 = time.perf_counter()
-
-        # 2. Decentralized Fleet Coordinator State Machine
-        fleet_decision = coordinator.update(
-            alpha_percept=alpha_metrics,
-            bravo_percept=bravo_metrics,
-            sim_time=sim_time,
-            dt=1.0 / FPS,
-        )
-        t_b1 = time.perf_counter()
-
-        # 3. Actuation & Physics Step (Beacon Spotlight + Mocap Setpoints + Crowd Dynamics)
-        env.set_beacon("alpha", fleet_decision["alpha_beacon"])
-        env.set_beacon("bravo", fleet_decision["bravo_beacon"])
-        env.step(
-            alpha_pos=fleet_decision["alpha_pos"],
-            bravo_pos=fleet_decision["bravo_pos"],
-            substeps=steps_per_frame,
-        )
-        t_a1 = time.perf_counter()
-
-        # Record stage latencies (Use pure OpenCV perception latency for onboard edge metric)
-        percept_ms = alpha_metrics["latency_ms"] + bravo_metrics["latency_ms"]
-        brain_ms = (t_b1 - t_p1) * 1000.0
-        act_ms = (t_a1 - t_b1) * 1000.0
-        tot_ms = percept_ms + brain_ms + act_ms
-
-        perception_latencies.append(percept_ms)
-        brain_latencies.append(brain_ms)
-        actuation_latencies.append(act_ms)
-        total_loop_latencies.append(tot_ms)
-
-        # Render 3rd-Person Spectator View and Stitch Side-by-Side with Drone Alpha Onboard HUD
-        world_rgb = env.render_camera("world_cam")
-        world_pane = annotate_world_cam(
-            world_rgb=world_rgb,
-            sim_time=sim_time,
-            fleet_decision=fleet_decision,
-            alpha_metrics=alpha_metrics,
-            bravo_metrics=bravo_metrics,
-            surge_active=env.surge_active,
-        )
-        combined_frame = np.hstack((world_pane, alpha_metrics["annotated_bgr"]))
-        writer.write(combined_frame)
-
-        if (frame_idx + 1) % (10 * FPS) == 0 or frame_idx == 0:
-            print(
-                f"  -> Sim t={sim_time + 1/FPS:5.1f}s | Mode: {fleet_decision['fleet_mode']:<23} | "
-                f"Alpha MaxCell: {alpha_metrics['max_cell_count']:2d} peds | "
-                f"Beacon: {str(fleet_decision['alpha_beacon']):<5} | "
-                f"Edge Loop: {tot_ms:.2f} ms"
-            )
+        # Offline evaluation sample (ground truth, NOT used by the drones)
+        if tick % CONTROL_HZ == 0:
+            peak, where = env.gt_peak_local_density(1.0)
+            timeline.append({"t": round(t, 1), "gt_peak_density": round(float(peak), 2),
+                             "incident_level": coordinator.incident["level"] if coordinator.incident else -1})
+            if tick % (10 * CONTROL_HZ) == 0:
+                print(f"t={t:5.1f}s  true peak density {peak:4.2f} p/m2  "
+                      f"| alpha {coordinator.state['alpha']}, bravo {coordinator.state['bravo']}")
 
     writer.release()
     env.close()
-    wall_elapsed = time.perf_counter() - wall_t0
 
-    # =====================================================================
-    # EDGE LATENCY BENCHMARK TABLE (TARGETING NVIDIA JETSON ORIN NANO)
-    # =====================================================================
-    def compute_stats(arr):
-        a = np.asarray(arr, dtype=np.float64)
-        return np.mean(a), np.std(a), np.percentile(a, 95), np.max(a)
+    peaks = np.array([s["gt_peak_density"] for s in timeline])
+    summary = {
+        "interventions": not args.no_interventions,
+        "seed": args.seed,
+        "duration_s": args.duration,
+        "gt_max_peak_density": float(peaks.max()),
+        "gt_seconds_at_or_above_4": int((peaks >= 4.0).sum()),
+        "gt_seconds_at_or_above_5": int((peaks >= 5.0).sum()),
+        "security_alerted": any("SECURITY" in e[1] for e in coordinator.events),
+        "events": [{"t": round(et, 1), "text": tx} for et, tx in coordinator.events],
+        "latency_ms_mean": {k: round(float(np.mean(v)), 3) for k, v in lat.items() if v},
+        "timeline": timeline,
+    }
+    with open(os.path.join(base, args.summary), "w") as f:
+        json.dump(summary, f, indent=1)
 
-    p_mean, p_std, p_p95, p_max = compute_stats(perception_latencies)
-    b_mean, b_std, b_p95, b_max = compute_stats(brain_latencies)
-    a_mean, a_std, a_p95, a_max = compute_stats(actuation_latencies)
-    t_mean, t_std, t_p95, t_max = compute_stats(total_loop_latencies)
-
-    print("\n" + "=" * 80)
-    print(f"[4/4] SIMULATION & VIDEO EXPORT COMPLETE in {wall_elapsed:.2f}s!")
-    print(f"      Deliverable Video: {video_out_path} ({total_frames} frames, {SIM_DURATION:.0f}s @ {FPS} FPS)")
-    print("=" * 80)
-    print("\n--- EDGE LATENCY BENCHMARK TABLE (TARGET: NVIDIA JETSON ORIN NANO 8GB) ---\n")
-    print("+-----------------------------------+------------+------------+------------+------------+")
-    print("| On-Device Pipeline Stage          |  Mean (ms) |   Std (ms) |   P95 (ms) |   Max (ms) |")
-    print("+-----------------------------------+------------+------------+------------+------------+")
-    print(f"| Dual-Cam Perception (OpenCV HSV)  | {p_mean:10.3f} | {p_std:10.3f} | {p_p95:10.3f} | {p_max:10.3f} |")
-    print(f"| Decentralized Brain (Fleet FSM)   | {b_mean:10.3f} | {b_std:10.3f} | {b_p95:10.3f} | {b_max:10.3f} |")
-    print(f"| Actuation & Physics Step (200Hz)  | {a_mean:10.3f} | {a_std:10.3f} | {a_p95:10.3f} | {a_max:10.3f} |")
-    print("+-----------------------------------+------------+------------+------------+------------+")
-    print(f"| Total Onboard Autonomous Loop     | {t_mean:10.3f} | {t_std:10.3f} | {t_p95:10.3f} | {t_max:10.3f} |")
-    print("+-----------------------------------+------------+------------+------------+------------+")
-    print(f"Sustained Edge Control Frequency: {1000.0 / max(t_mean, 1e-6):.1f} Hz (33.3 ms budget @ 30 FPS)\n")
+    print("\n" + "=" * 70)
+    print(f"Done in {time.perf_counter() - wall0:.0f}s wall time. Video: {video_path}")
+    print("EVALUATION (simulator ground truth, peak density in any 1 m-radius circle):")
+    print(f"  max peak density      {summary['gt_max_peak_density']:.2f} people/m2")
+    print(f"  seconds >= 4 p/m2     {summary['gt_seconds_at_or_above_4']}")
+    print(f"  seconds >= 5 p/m2     {summary['gt_seconds_at_or_above_5']}")
+    print("Mean stage latency on THIS machine (ms): " +
+          ", ".join(f"{k} {v}" for k, v in summary["latency_ms_mean"].items()))
+    print(f"Summary written to {args.summary}")
 
 
 if __name__ == "__main__":

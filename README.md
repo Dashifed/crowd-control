@@ -1,120 +1,116 @@
-# Autonomous Crowd-Density Dispersion & Coordinated Drone Fleet
+# CrowdFlow: Drone Crowd-Safety Monitoring (MuJoCo prototype)
 
-[![Track](https://img.shields.io/badge/Agentverse_Hackathon-Robotics_Track-blue)](#)
-[![Simulator](https://img.shields.io/badge/Physics-MuJoCo_3.x-orange)](#)
-[![Perception](https://img.shields.io/badge/Perception-OpenCV_HSV_%2B_Spatial_Grid-green)](#)
-[![Edge Target](https://img.shields.io/badge/Edge_Target-NVIDIA_Jetson_Orin_Nano_(8GB)-76B900)](#)
+Two camera drones watch a 100-person concert floor, notice when the area in front of the stage is
+becoming dangerously packed, and try to **prevent** a crush with escalating, non-physical
+interventions: a red spotlight, a spoken announcement, and finally a notification to the security team.
 
-> **"Give an Agent a Body"** — A 100% on-device, decentralized multi-drone autonomy stack built in pure Python with **MuJoCo**, **OpenCV**, and **NumPy** to detect developing crowd crush hazards from overhead, physically disperse dangerous clusters using an aerial **Red Warning Beacon**, and dynamically adapt fleet patrol orbits to eliminate surveillance blind spots.
+This is a **simulation prototype for decision support**. It is not a validated crowd-safety system and
+the drones never touch, push or herd anyone.
 
----
+## Scenario: stage front
 
-## Overview
+* Venue: 20 m × 15 m indoor floor, stage on the west wall behind a barrier, bar on the east wall.
+  100 people average ~0.37 people/m², but the strip in front of the stage centre is only a few m².
+* People: 60 fans, 28 casual attendees, 12 moving to and from the bar. Each fan decides **at a random
+  time** to head for the centre of the stage barrier, and keeps pressing forward once there.
+* Nothing is scripted to "surge" at a fixed time. Congestion emerges because many people want the
+  same few square metres.
 
-High-density crowd surges at music festivals, stadium exits, and transit bottlenecks turn hazardous within seconds when localized density exceeds **6–8 people per 2.5m x 2.5m cell**. Fixed CCTV cameras suffer from severe perspective occlusion and rely on human control rooms or congested cellular networks that fail during mass gatherings.
+| Run (seed 2026, 90 s) | Peak density* | Time at ≥ 4 people/m² | Time at ≥ 5 people/m² |
+|---|---|---|---|
+| Drones observe only (`--no-interventions`) | 6.05 people/m² | 64 s | 59 s |
+| Drones intervene | 4.46 people/m² | 6 s | 0 s |
 
-This repository implements two complete autonomous crowd-safety simulation pipelines:
-1. **Modular Coordinated 2-Drone Dispersion Fleet ([`run_simulation.py`](run_simulation.py)):**
-   - **Drone Alpha (Gold)** and **Drone Bravo (Blue)** patrol adjacent venue sectors at `z = 4.2m`.
-   - When an unscripted crowd surge creates a high-density crush cluster (>= 8 pedestrians in a 2.5m x 2.5m window), **Drone Alpha** autonomously descends to `z = 3.0m` directly over the hotspot and activates a downward **Red Dispersion Beacon** spotlight, guiding pedestrians smoothly outward until safe spacing is restored.
-   - Simultaneously, **Drone Bravo** executes **Coordinated Fleet Adaptation**, shifting its orbit to center-stage at `z = 4.55m` to cover the surveillance blind spot while Alpha is engaged at low altitude.
-2. **Single-File Chokepoint Rerouting Baseline ([`run_all.py`](run_all.py)):**
-   - Self-contained single-script implementation where an autonomous drone monitors dual exits (`Exit A` and `Exit B`), detects an unscripted barrier blockage at `Exit A`, dynamically redirects crowd flow to `Exit B`, conducts autonomous recon sweeps to detect when `Exit A` reopens, and load-balances pedestrian traffic across both exits.
+\*Measured afterwards from simulator ground truth: most people inside any 1 m-radius circle. The drones
+never see ground truth. Crowd-safety guidance commonly treats sustained densities above ~5 people/m² as
+dangerous. The crowd model is stylised, so these numbers show the system works *in this simulation*,
+not in a real venue.
 
----
-
-## System Architecture
-
-```text
-+-----------------------------------------------------------------------------------+
-|                      ONBOARD EDGE COMPUTE (PER DRONE NODE)                        |
-|                                                                                   |
-|  [Downward RGB Cam] ---> [HSV Centroid + Homography] ---> [2.5m x 2.5m Grid]      |
-|     (640x480 @ 30Hz)         (~5.4 ms per Cam)             (Crush Risk >= 8 Peds) |
-|                                                                      |            |
-|  [7.0m Ceiling Hold] <--- (Conf < 0.50) --- [Decentralized Fleet FSM] <---+       |
-|                                                |                  |               |
-|                                   (Alpha: Intervention)   (Bravo: Blind-Spot)     |
-|                                                v                  v               |
-|                                       [Descend z=3.0m +]  [Shift Orbit x=0.25m]   |
-|                                       [Red Beacon Beam ]  [Center Overwatch   ]   |
-+-----------------------------------------------------------------------------------+
-```
-
-### Key Autonomy States ([`brain/fleet_planner.py`](brain/fleet_planner.py))
-- **`PATROL`:** Split-sector figure-8 surveillance at nominal altitude (`z = 4.2m`).
-- **`DISPERSION_INTERVENTION`:** Triggered when `DensityPerceptionEngine` flags a critical cluster (>= 8 pedestrians in a 2.5m x 2.5m cell). Drone Alpha locks onto the cluster centroid, descends to `z = 3.0m`, and activates its downward red spotlight and ground beacon ring.
-- **`COORDINATED_FLEET_ADAPTATION`:** Drone Bravo automatically shifts from Sector 2 to a high center-stage orbit (`x = 0.25m, z = 4.55m`) to maintain full-arena visibility while Alpha is at low altitude.
-- **`RECOVERY`:** Once onboard perception confirms local density has dropped back to nominal (`< 5` peds/cell), Drone Alpha extinguishes the red beacon and climbs back to `4.2m` before resuming split-sector `PATROL`.
-- **`FAILSAFE`:** If camera confidence drops below `50%` (e.g., lens occlusion, smoke, or sensor noise), the drone immediately disables its beacon and climbs to a **`z = 7.0m` ceiling hold altitude** so it never descends blindly above a crowd.
-
----
-
-## Repository Structure
+## How it works (closed loop, every 0.1 s)
 
 ```text
-crowd-management-drone/
-├── config/
-│   └── arena.xml                 # MuJoCo MJCF model (arena, 18 2-DOF pedestrians, 2 mocap drones & spotlights)
-├── sim/
-│   └── drone_env.py              # CrowdFleetEnv: social-force crowd physics, surge trigger & beacon repulsion
-├── perception/
-│   └── density_detector.py       # DensityPerceptionEngine: OpenCV HSV segmentation, homography & HUD overlay
-├── brain/
-│   └── fleet_planner.py          # FleetCoordinator: 100% local decentralized finite state machine
-├── docs/
-│   ├── technical_summary.md      # 1-Page Technical Summary deliverable (architecture, Jetson budget, failsafe)
-│   └── pitch_script.md           # 5-Minute live competition pitch script & demo walkthrough
-├── run_simulation.py             # Main orchestrator for the 2-drone crowd-density dispersion fleet
-├── run_all.py                    # Standalone single-file chokepoint blockage & dual-exit load-balancing demo
-├── requirements.txt              # Python dependencies (mujoco, opencv-python, numpy)
-└── submission_video.mp4          # Generated 60s @ 30 FPS side-by-side competition deliverable video
+ cameras ──► head detection ──► tracking ──► fleet crowd map + score C (1 Hz)
+    ▲                                                     │
+    │                                                     ▼
+ people react (or not) ◄── spotlight / announcement ◄── fleet coordinator
+                           security notification        (patrol, respond, escalate)
 ```
 
----
+1. **Perception** (`perception/density_detector.py`): each drone's downward camera (640×480) is
+   segmented for heads. In a dense crowd bodies merge into one blob but heads stay separate, so
+   counting heads stays reliable. Heads are projected to floor coordinates using the drone's pose.
+   *In the sim all heads share one colour. A real system would swap in a learned detector (e.g. YOLO);
+   nothing downstream changes.*
+2. **Tracking** (`perception/tracker.py`): detections are linked across frames (Hungarian matching,
+   0.4 m gate), giving each person a temporary ID, a speed and a heading.
+3. **Fleet crowd map** (`perception/zone_analytics.py`): both drones' tracks are fused into 2 m × 2 m
+   overlapping zones. Each zone gets density, speed, growth, share stopped and flow dispersion, combined
+   into a congestion score **C** (0–100) using the weights in the team brief. The status is
+   NORMAL < 25 ≤ DEVELOPING < 50 ≤ HIGH < 75 ≤ CRITICAL. Unseen zones are *unknown*, never "empty".
+4. **Fleet coordinator** (`brain/fleet_planner.py`): Alpha patrols the stage half and Bravo the bar
+   half at 7 m. When a zone is DEVELOPING for 3 s, the nearer drone descends to 5.5 m over it and the
+   other climbs to 8 m to cover the gap. It then runs the escalation ladder:
 
-## Quickstart & Installation
+| Level | Trigger | Action |
+|---|---|---|
+| 0 MONITOR | zone DEVELOPING for 3 s | responder moves over it to look closer |
+| 1 SPOTLIGHT | HIGH for 2 s, or DEVELOPING ≥ 2 people/m² and filling up | red spotlight marks the area |
+| 2 ANNOUNCE | still HIGH 8 s later, or CRITICAL | "please make space at the front", naming uncrowded side areas the drones **can see** are free (up to 3 repeats) |
+| 3 SECURITY | still HIGH 15 s after the announcement, or still CRITICAL 10 s after it | notify the security team (operator notification only) |
+| RESOLVED | zone below HIGH for 8 s | spotlight off, back to patrol |
 
-### 1. Prerequisites
-- Python **3.9+** (tested on Windows, Linux, and macOS)
-- No GPU or external 3D mesh files required—runs out-of-the-box on CPU.
+5. **People's response** (`sim/drone_env.py`): the spotlight and announcement only change what people
+   know. Each person has a responsiveness (0.35–0.90) and a reaction delay (1–8 s). People in the
+   spotlight may stop pushing forward. People who follow an announcement walk to the nearest named
+   side area, and stop early if it is already busy. This is a stylised model, not a validated
+   human-behaviour model.
 
-### 2. Install Dependencies
+**Lesson built into the design:** an early version sent everyone to one side area, which simply became
+the next hotspot. The coordinator now spreads people over several observed, uncrowded areas.
+
+### Adaptations of the brief's score for a standing audience
+The brief's score was designed for walking flows. At a concert, standing still at 1–2 people/m² is
+normal, so:
+* speed, stopping and direction terms are scaled by a density gate `clamp((ρ − 2.0) / 1.5, 0, 1)`
+* growth is scaled by `clamp(ρ − 1.0, 0, 1)`
+* critical override B uses ρ ≥ 3.0 instead of 2.5.
+
+All thresholds and weights are prototype choices, not validated safety limits.
+
+## Run it
+
 ```bash
 pip install -r requirements.txt
+python config/generate_arena.py          # only needed after changing the venue
+python run_simulation.py                  # 90 s, 30 FPS -> submission_video.mp4 + run_summary.json
+python run_simulation.py --no-interventions --out baseline.mp4 --summary baseline.json
 ```
 
-### 3. Run the Coordinated 2-Drone Dispersion Simulation
-```bash
-python run_simulation.py
-```
-This runs a 60-second closed-loop simulation (`1,800` frames at `30 FPS`), automatically exports the side-by-side competition video (`world_cam` + `cam_alpha` onboard HUD) to `submission_video.mp4`, and prints the on-device latency benchmark table to the console.
+Options: `--duration`, `--fps` (multiple of 10), `--seed`, `--camera-fault` (corrupts Alpha's camera at
+70–74 s to show the failsafe: spotlight off, climb to 8 m).
 
-*(Optional)* To run the standalone single-file Chokepoint Rerouting & Load-Balancing simulation:
-```bash
-python run_all.py
-```
+The video shows the world view, the active drone's camera (tracked heads coloured moving / slow /
+stopped), and an operator panel: the fleet crowd map, the escalation ladder, the worst zone's metrics,
+and the operator log.
 
----
+On a headless Linux machine, set `MUJOCO_GL=egl`.
 
-## On-Device Latency Benchmark
-
-Measured across `N = 1,800` frames (`60s @ 30 FPS`, dual `640x480` camera streams + `200 Hz` MuJoCo physics):
+## Repository
 
 ```text
-+-----------------------------------+------------+------------+------------+------------+
-| On-Device Pipeline Stage          |  Mean (ms) |   Std (ms) |   P95 (ms) |   Max (ms) |
-+-----------------------------------+------------+------------+------------+------------+
-| Dual-Cam Perception (OpenCV HSV)  |     10.787 |      1.690 |     13.137 |     51.865 |
-| Decentralized Brain (Fleet FSM)   |      0.066 |      0.034 |      0.110 |      0.500 |
-| Actuation & Physics Step (200Hz)  |     10.265 |      2.058 |     12.845 |     19.763 |
-+-----------------------------------+------------+------------+------------+------------+
-| Total Onboard Autonomous Loop     |     21.118 |      2.622 |     24.711 |     63.176 |
-+-----------------------------------+------------+------------+------------+------------+
-Sustained Edge Control Frequency: 47.4 Hz (33.3 ms real-time budget @ 30 FPS)
+config/generate_arena.py   venue + 100 pedestrians + 2 drones -> config/arena.xml (generated)
+sim/drone_env.py           physics, crowd behaviour, response to drone outputs, ground-truth evaluation
+perception/                head detector, tracker, fleet crowd map + score C
+brain/fleet_planner.py     patrol, responder/overwatch roles, escalation ladder, failsafe
+run_simulation.py          main loop, video + operator panel, evaluation summary
+run_all.py                 older standalone exit-blockage demo (separate, unchanged)
+docs/                      pitch script and summary for the EARLIER 18-person version (out of date)
 ```
 
----
+## Limitations
 
-## Documentation
-- **[1-Page Technical Summary](docs/technical_summary.md):** Problem statement, decentralized architecture diagram, NVIDIA Jetson Orin Nano (8GB) hardware budget, and failsafe analysis.
+* Simulation only: simple cylinder pedestrians, stylised behaviour and compliance, indoor venue.
+* Head detection relies on a uniform head colour in the sim.
+* Latency figures printed at the end are from the machine you run on, not from drone hardware.
+* No battery model yet (planned), no live operator controls yet (the video shows the panel only).
+* The drone speaker's audibility over concert audio is assumed, not modelled.
