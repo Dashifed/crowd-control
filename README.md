@@ -87,7 +87,18 @@ python run_simulation.py --no-interventions --out baseline.mp4 --summary baselin
 ```
 
 Options: `--duration`, `--fps` (multiple of 10), `--seed`, `--camera-fault` (corrupts Alpha's camera at
-70–74 s to show the failsafe: spotlight off, climb to 8 m).
+70–74 s to show the failsafe: spotlight off, climb to 8 m), `--no-video` (numbers only, faster; the
+drones still use their cameras, so results are identical), `--quiet`.
+
+### Evaluate across many crowds
+
+```bash
+python evaluate.py                          # seeds 1-10, drones on vs observe-only
+python evaluate.py --seeds 10 --workers 4   # run 4 simulations in parallel
+python evaluate.py --label before_prediction
+```
+
+Prints a comparison table and saves it to `results/<label>.json` (per-run details in `results/runs/`).
 
 The video shows the world view, the active drone's camera (tracked heads coloured moving / slow /
 stopped), and an operator panel: the fleet crowd map, the escalation ladder, the worst zone's metrics,
@@ -103,6 +114,7 @@ sim/drone_env.py           physics, crowd behaviour, response to drone outputs, 
 perception/                head detector, tracker, fleet crowd map + score C
 brain/fleet_planner.py     patrol, responder/overwatch roles, escalation ladder, failsafe
 run_simulation.py          main loop, video + operator panel, evaluation summary
+evaluate.py                multi-seed comparison: drones intervening vs observing only
 run_all.py                 older standalone exit-blockage demo (separate, unchanged)
 docs/                      pitch script and summary for the EARLIER 18-person version (out of date)
 ```

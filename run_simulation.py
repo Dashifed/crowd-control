@@ -16,6 +16,7 @@ Usage:
     python run_simulation.py --fps 10           # faster rendering
     python run_simulation.py --no-interventions # baseline: drones watch but never act
     python run_simulation.py --camera-fault     # inject a camera fault at 70-74 s
+    python run_simulation.py --no-video         # fast: numbers only, no rendering of the overview
 """
 
 import argparse
@@ -146,7 +147,7 @@ def draw_panel(crowd_map, coordinator, t, drone_pos, beacon):
 
 
 # ---------------------------------------------------------------------- main loop
-def main():
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration", type=float, default=90.0)
     ap.add_argument("--fps", type=int, default=30, help="video FPS (multiple of 10)")
@@ -155,8 +156,16 @@ def main():
     ap.add_argument("--camera-fault", action="store_true", help="inject Alpha camera fault 70-74 s")
     ap.add_argument("--out", default="submission_video.mp4")
     ap.add_argument("--summary", default="run_summary.json")
-    args = ap.parse_args()
+    ap.add_argument("--no-video", action="store_true",
+                    help="skip the overview camera and video file (much faster; drones still use their cameras)")
+    ap.add_argument("--quiet", action="store_true", help="only print the final evaluation")
+    return ap
+
+
+def run(args):
+    """Runs one simulation and returns the evaluation summary (also written to args.summary)."""
     assert args.fps % CONTROL_HZ == 0, "--fps must be a multiple of 10"
+    say = (lambda *a, **k: None) if args.quiet else print
 
     base = os.path.dirname(os.path.abspath(__file__))
     env = CrowdFleetEnv(frame_width=FRAME_W, frame_height=FRAME_H, seed=args.seed)
@@ -166,11 +175,10 @@ def main():
     coordinator = FleetCoordinator(interventions_enabled=not args.no_interventions)
 
     video_path = os.path.join(base, args.out)
-    writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
-                             (FRAME_W * 2, FRAME_H + PANEL_H))
+    writer = None if args.no_video else cv2.VideoWriter(
+        video_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (FRAME_W * 2, FRAME_H + PANEL_H))
     frames_per_tick = args.fps // CONTROL_HZ
     steps_per_tick = int(round(1.0 / CONTROL_HZ / env.sim_dt))
-    sub = steps_per_tick // frames_per_tick
     dt = 1.0 / CONTROL_HZ
     n_ticks = int(args.duration * CONTROL_HZ)
 
@@ -178,7 +186,7 @@ def main():
     timeline = []
     last_announcement = None
     wall0 = time.perf_counter()
-    print(f"Running {args.duration:.0f}s, {env.num_pedestrians} people, "
+    say(f"Running {args.duration:.0f}s, {env.num_pedestrians} people, "
           f"interventions {'OFF' if args.no_interventions else 'ON'} ...")
 
     for tick in range(n_ticks):
@@ -212,7 +220,7 @@ def main():
         out = coordinator.update(crowd_map, cam_ok, t, dt)
         lat["brain"].append(out["brain_ms"])
         for et, text in coordinator.events[n_events:]:
-            print(f"  [{et:5.1f}s] {text}")
+            say(f"  [{et:5.1f}s] {text}")
 
         # 4. Act
         for d in ("alpha", "bravo"):
@@ -223,22 +231,14 @@ def main():
             last_announcement = (t, "please make space at the front - move to the sides"
                                  if len(ann["relief"]) else "please stop pushing forward")
             coordinator.log(t, f"{n} people chose to follow the announcement")
-            print(f"  [{t:5.1f}s] {coordinator.events[-1][1]}")
+            say(f"  [{t:5.1f}s] {coordinator.events[-1][1]}")
 
         # 5. Physics + video frames
-        show = coordinator.incident["responder"] if coordinator.incident else "alpha"
-        drone_img = draw_drone_pane(percepts[show], tracks[show], show, coordinator.pos[show],
-                                    coordinator.state[show], detector, crowd_map, t,
-                                    coordinator.beacon[show])
-        panel = draw_panel(crowd_map, coordinator, t, coordinator.pos, coordinator.beacon)
-        for f in range(frames_per_tick):
-            env.step(coordinator.pos, substeps=sub)
-            world = draw_world_pane(env.render_camera("world_cam"), env.data.time, args.duration,
-                                    coordinator, not args.no_interventions, last_announcement)
-            writer.write(np.vstack([np.hstack([world, drone_img]), panel]))
-        leftover = steps_per_tick - sub * frames_per_tick
-        if leftover:
-            env.step(coordinator.pos, substeps=leftover)
+        if writer is None:
+            env.step(coordinator.pos, substeps=steps_per_tick)
+        else:
+            write_frames(env, writer, args, coordinator, crowd_map, detector, percepts, tracks,
+                         t, last_announcement, frames_per_tick, steps_per_tick)
 
         # Offline evaluation sample (ground truth, NOT used by the drones)
         if tick % CONTROL_HZ == 0:
@@ -246,12 +246,35 @@ def main():
             timeline.append({"t": round(t, 1), "gt_peak_density": round(float(peak), 2),
                              "incident_level": coordinator.incident["level"] if coordinator.incident else -1})
             if tick % (10 * CONTROL_HZ) == 0:
-                print(f"t={t:5.1f}s  true peak density {peak:4.2f} p/m2  "
-                      f"| alpha {coordinator.state['alpha']}, bravo {coordinator.state['bravo']}")
+                say(f"t={t:5.1f}s  true peak density {peak:4.2f} p/m2  "
+                    f"| alpha {coordinator.state['alpha']}, bravo {coordinator.state['bravo']}")
 
-    writer.release()
+    if writer is not None:
+        writer.release()
     env.close()
+    return finish(args, base, coordinator, timeline, lat, wall0, video_path, say)
 
+
+def write_frames(env, writer, args, coordinator, crowd_map, detector, percepts, tracks,
+                 t, last_announcement, frames_per_tick, steps_per_tick):
+    """Advances physics for one control tick while writing the video frames."""
+    sub = steps_per_tick // frames_per_tick
+    show = coordinator.incident["responder"] if coordinator.incident else "alpha"
+    drone_img = draw_drone_pane(percepts[show], tracks[show], show, coordinator.pos[show],
+                                coordinator.state[show], detector, crowd_map, t,
+                                coordinator.beacon[show])
+    panel = draw_panel(crowd_map, coordinator, t, coordinator.pos, coordinator.beacon)
+    for f in range(frames_per_tick):
+        env.step(coordinator.pos, substeps=sub)
+        world = draw_world_pane(env.render_camera("world_cam"), env.data.time, args.duration,
+                                coordinator, not args.no_interventions, last_announcement)
+        writer.write(np.vstack([np.hstack([world, drone_img]), panel]))
+    leftover = steps_per_tick - sub * frames_per_tick
+    if leftover:
+        env.step(coordinator.pos, substeps=leftover)
+
+
+def finish(args, base, coordinator, timeline, lat, wall0, video_path, say):
     peaks = np.array([s["gt_peak_density"] for s in timeline])
     summary = {
         "interventions": not args.no_interventions,
@@ -268,15 +291,21 @@ def main():
     with open(os.path.join(base, args.summary), "w") as f:
         json.dump(summary, f, indent=1)
 
-    print("\n" + "=" * 70)
-    print(f"Done in {time.perf_counter() - wall0:.0f}s wall time. Video: {video_path}")
-    print("EVALUATION (simulator ground truth, peak density in any 1 m-radius circle):")
-    print(f"  max peak density      {summary['gt_max_peak_density']:.2f} people/m2")
-    print(f"  seconds >= 4 p/m2     {summary['gt_seconds_at_or_above_4']}")
-    print(f"  seconds >= 5 p/m2     {summary['gt_seconds_at_or_above_5']}")
-    print("Mean stage latency on THIS machine (ms): " +
-          ", ".join(f"{k} {v}" for k, v in summary["latency_ms_mean"].items()))
-    print(f"Summary written to {args.summary}")
+    say("\n" + "=" * 70)
+    say(f"Done in {time.perf_counter() - wall0:.0f}s wall time."
+        + ("" if args.no_video else f" Video: {video_path}"))
+    say("EVALUATION (simulator ground truth, peak density in any 1 m-radius circle):")
+    say(f"  max peak density      {summary['gt_max_peak_density']:.2f} people/m2")
+    say(f"  seconds >= 4 p/m2     {summary['gt_seconds_at_or_above_4']}")
+    say(f"  seconds >= 5 p/m2     {summary['gt_seconds_at_or_above_5']}")
+    say("Mean stage latency on THIS machine (ms): " +
+        ", ".join(f"{k} {v}" for k, v in summary["latency_ms_mean"].items()))
+    say(f"Summary written to {args.summary}")
+    return summary
+
+
+def main():
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":
