@@ -47,16 +47,21 @@ not in a real venue.
    overlapping zones. Each zone gets density, speed, growth, share stopped and flow dispersion, combined
    into a congestion score **C** (0–100) using the weights in the team brief. The status is
    NORMAL < 25 ≤ DEVELOPING < 50 ≤ HIGH < 75 ≤ CRITICAL. Unseen zones are *unknown*, never "empty".
+   **Early warning:** each zone also gets a short-range prediction (+10/+20/+30 s), the higher of
+   two signals: the density trend over the last 30 s, and the people currently *walking towards* the
+   zone who would arrive in time. The second catches a wave of fans heading for the stage before the
+   density itself rises.
 4. **Fleet coordinator** (`brain/fleet_planner.py`): Alpha patrols the stage half and Bravo the bar
-   half at 7 m. When a zone is DEVELOPING for 3 s, the nearer drone descends to 5.5 m over it and the
-   other climbs to 8 m to cover the gap. It then runs the escalation ladder:
+   half at 7 m. When a zone is DEVELOPING, or predicted to become dense, the nearer drone descends to
+   5.5 m over it and the other climbs to 8 m to cover the gap, always keeping the stage front in view.
+   It then runs the escalation ladder ("predicted" = density expected in 20 s):
 
 | Level | Trigger | Action |
 |---|---|---|
-| 0 MONITOR | zone DEVELOPING for 3 s | responder moves over it to look closer |
-| 1 SPOTLIGHT | HIGH for 2 s, or DEVELOPING ≥ 2 people/m² and filling up | red spotlight marks the area |
-| 2 ANNOUNCE | still HIGH 8 s later, or CRITICAL | "please make space at the front", naming uncrowded side areas the drones **can see** are free (up to 3 repeats) |
-| 3 SECURITY | still HIGH 15 s after the announcement, or still CRITICAL 10 s after it | notify the security team (operator notification only) |
+| 0 MONITOR | zone DEVELOPING for 3 s, or ≥ 1.5 people/m² and predicted ≥ 3.5 | responder moves over it to look closer |
+| 1 SPOTLIGHT | HIGH for 2 s, DEVELOPING ≥ 2 people/m² and filling up, or predicted ≥ 3.5 | red spotlight marks the area |
+| 2 ANNOUNCE | still HIGH 8 s later, CRITICAL, or predicted ≥ 4.0 | "please make space at the front", naming uncrowded side areas the drones **can see** are free (repeated after 10 s if not improving, up to 3 times) |
+| 3 SECURITY | **only if density is not falling:** still HIGH 20 s after the announcement, or still CRITICAL 15 s after it | notify the security team (operator notification only) |
 | RESOLVED | zone below HIGH for 8 s | spotlight off, back to patrol |
 
 5. **People's response** (`sim/drone_env.py`): the spotlight and announcement only change what people
@@ -100,6 +105,14 @@ python evaluate.py --label before_prediction
 
 Prints a comparison table and saves it to `results/<label>.json` (per-run details in `results/runs/`).
 
+### Comparison video and plots
+
+```bash
+python side_by_side.py --seed 5                 # same crowd without / with CrowdFlow -> side_by_side.mp4
+python side_by_side.py --seed 5 --clip 15 50 --gif   # plus a short clip and GIF for posts
+python plot_results.py --label evaluation       # results/density_timeline.png, results/per_seed.png
+```
+
 The video shows the world view, the active drone's camera (tracked heads coloured moving / slow /
 stopped), and an operator panel: the fleet crowd map, the escalation ladder, the worst zone's metrics,
 and the operator log.
@@ -115,6 +128,8 @@ perception/                head detector, tracker, fleet crowd map + score C
 brain/fleet_planner.py     patrol, responder/overwatch roles, escalation ladder, failsafe
 run_simulation.py          main loop, video + operator panel, evaluation summary
 evaluate.py                multi-seed comparison: drones intervening vs observing only
+side_by_side.py            comparison video (same crowd, without vs with drones) + clip/GIF
+plot_results.py            timeline and per-crowd plots from evaluate.py results
 run_all.py                 older standalone exit-blockage demo (separate, unchanged)
 docs/                      pitch script and summary for the EARLIER 18-person version (out of date)
 ```

@@ -6,18 +6,22 @@ Drone roles
     PATROL      Alpha watches the stage half, Bravo the bar half, both sweeping north/south
                 at 7 m so the whole floor is revisited.
     RESPONDER   the drone nearest an incident descends to 5.5 m over it.
-    OVERWATCH   the other drone climbs to 8 m over mid-floor to cover the gap.
+    OVERWATCH   the other drone climbs to 8 m to cover the gap. If the responder has left
+                the stage front (the venue's priority area), overwatch covers the stage front.
     FAILSAFE    camera unhealthy -> spotlight off, climb to 8 m and hold.
 
-Escalation ladder for one incident (all thresholds are prototype choices):
-    0 MONITOR    worst zone DEVELOPING for 3 s -> responder moves over it to look closer
-    1 SPOTLIGHT  HIGH for 2 s of fresh data, or DEVELOPING at >= 2 people/m2 and filling
-                 up (growth >= 0.3 people/m2/min) for 4 s -> red spotlight marks the area
-    2 ANNOUNCE   still HIGH 10 s after the spotlight, or CRITICAL -> announcement asking
-                 people to move to the less crowded side areas (chosen from the map)
-    3 SECURITY   still HIGH 15 s after the announcement, or still CRITICAL 10 s after it ->
-                 notify security / bodyguards (operator notification only)
-    RESOLVED     zone below HIGH for 6 s -> spotlight off, drones return to patrol
+Escalation ladder for one incident (all thresholds are prototype choices).
+"pred" = the zone's density trend projected 20 s ahead (perception/zone_analytics.py).
+    0 MONITOR    worst zone DEVELOPING for 3 s, or a zone already at >= 1.5 people/m2 heading
+                 for >= 3.5 (pred) for 2 s -> responder moves over it to look closer
+    1 SPOTLIGHT  HIGH for 2 s of fresh data, DEVELOPING at >= 2 people/m2 and filling up
+                 for 4 s, or pred >= 3.5 for 2 s -> red spotlight marks the area
+    2 ANNOUNCE   still HIGH 8 s after the spotlight, CRITICAL, or pred >= 4.0 after 3 s of
+                 spotlight -> announcement asking people to move to uncrowded side areas
+    3 SECURITY   only if the area is NOT improving (density not falling over the last 5 s):
+                 still HIGH 20 s after the announcement, or still CRITICAL 15 s after it
+                 (people need time to react and walk) -> notify security (notification only)
+    RESOLVED     zone below HIGH for 8 s -> spotlight off, drones return to patrol
 """
 
 import time
@@ -27,7 +31,9 @@ PATROL_Z, RESPOND_Z, OVERWATCH_Z, FAILSAFE_Z = 7.0, 5.5, 8.0, 8.0
 MAX_SPEED = 2.0                     # m/s
 SWEEP_AMPLITUDE, SWEEP_PERIOD = 2.8, 24.0
 PATROL_X = {"alpha": -4.5, "bravo": 4.5}
-OVERWATCH_XY = np.array([1.0, 0.0])
+OVERWATCH_XY = np.array([3.4, 0.0])           # covers mid-floor and the bar side
+STAGE_WATCH_XY = np.array([-4.5, 0.0])         # covers the stage front (priority area)
+STAGE_FRONT_X = -6.0                           # x below this = stage front
 
 STATUS = ["NORMAL", "DEVELOPING", "HIGH", "CRITICAL"]
 LADDER = ["MONITOR", "SPOTLIGHT", "ANNOUNCE", "SECURITY"]
@@ -37,6 +43,12 @@ RELIEF_CANDIDATES = np.array([[-7.4, 4.5], [-7.4, -4.5], [-6.4, 5.8], [-6.4, -5.
                               [-3.4, 2.5], [-3.4, -2.5]])
 TARGET_RELIEF_DENSITY = 1.5          # people/m2 we are willing to fill a relief area up to
 MAX_ANNOUNCEMENTS = 3
+PRED_H = 20                          # seconds ahead used by the ladder
+PRED_WATCH, PRED_SPOT, PRED_ANNOUNCE = 3.5, 3.5, 4.0     # people/m2
+
+
+def pred_of(z):
+    return None if z is None or z.pred is None else z.pred[PRED_H]
 
 
 class FleetCoordinator:
@@ -48,6 +60,7 @@ class FleetCoordinator:
         self.enabled = interventions_enabled
         self.incident = None            # dict describing the active incident
         self.developing_since = None
+        self.heading_since = None       # a zone's trend has predicted high density since then
         self.events = []                # (time, text) operator log
         self.pending_announcement = None
         self.security_alert = False
@@ -116,7 +129,8 @@ class FleetCoordinator:
             elif responder is not None:
                 self.state[d] = "OVERWATCH"
                 self.beacon[d] = False
-                target = np.array([OVERWATCH_XY[0], OVERWATCH_XY[1], OVERWATCH_Z])
+                xy = OVERWATCH_XY if self.incident["xy"][0] < STAGE_FRONT_X else STAGE_WATCH_XY
+                target = np.array([xy[0], xy[1], OVERWATCH_Z])
             else:
                 self.state[d] = "PATROL"
                 self.beacon[d] = False
@@ -128,17 +142,29 @@ class FleetCoordinator:
     def _update_incident(self, crowd_map, worst, t):
         inc = self.incident
         if inc is None:
-            if worst is not None and worst.status >= 1:
+            # Early warning: a zone whose trend says it will be dense in 20 s.
+            heading = [z for z in crowd_map.zones if crowd_map.freshness(z, t) == "fresh"
+                       and z.rho is not None and z.rho >= 1.5 and (pred_of(z) or 0) >= PRED_WATCH]
+            if heading:
+                self.heading_since = self.heading_since or t
+            else:
+                self.heading_since = None
+            early = heading and t - self.heading_since >= 2.0
+            if early and (worst is None or worst.status < 1 or
+                          (pred_of(max(heading, key=pred_of)) or 0) > (worst.rho or 0)):
+                worst = max(heading, key=pred_of)
+            if worst is not None and (worst.status >= 1 or early):
                 self.developing_since = self.developing_since or t
-                if t - self.developing_since >= 3.0:
+                if t - self.developing_since >= 3.0 or early:
                     responder = min(("alpha", "bravo"),
                                     key=lambda d: np.linalg.norm(self.pos[d][:2] - worst.centroid))
                     self.incident = {"xy": worst.centroid.copy(), "level": 0, "level_since": t,
                                      "responder": responder, "start": t, "calm_since": None,
                                      "critical_since": None, "confirm_since": None,
                                      "peak_status": worst.status}
-                    self.log(t, f"MONITOR: {STATUS[worst.status]} "
-                                f"crowding near ({worst.centroid[0]:+.1f}, {worst.centroid[1]:+.1f}); "
+                    why = (f"density heading for {pred_of(worst):.1f} p/m2 in {PRED_H}s" if early
+                           else f"{STATUS[worst.status]} crowding")
+                    self.log(t, f"MONITOR: {why} near ({worst.centroid[0]:+.1f}, {worst.centroid[1]:+.1f}); "
                                 f"{responder.upper()} moving in to inspect")
             else:
                 self.developing_since = None
@@ -158,29 +184,39 @@ class FleetCoordinator:
         critical = status == 3
         inc["critical_since"] = (inc["critical_since"] or t) if critical else None
         level, since = inc["level"], inc["level_since"]
+        fresh = crowd_map.freshness(z, t) == "fresh"
+        pred = pred_of(z) if fresh else None
+        improving = z.change5 is not None and z.change5 < -0.15     # density falling over ~5 s
 
         def escalate(new_level, reason):
             inc["level"], inc["level_since"] = new_level, t
             self.log(t, f"{LADDER[new_level]}: {reason}")
 
         if level == 0:
-            fresh = crowd_map.freshness(z, t) == "fresh"
             filling = status == 1 and z.rho >= 2.0 and z.growth is not None and z.growth >= 0.3
-            confirm = fresh and (status >= 2 or filling)
+            heading = pred is not None and pred >= PRED_SPOT
+            confirm = fresh and (status >= 2 or filling or heading)
             inc["confirm_since"] = (inc["confirm_since"] or t) if confirm else None
-            if inc["confirm_since"] is not None and t - inc["confirm_since"] >= (2.0 if status >= 2 else 4.0):
-                why = "HIGH confirmed" if status >= 2 else f"area filling up ({z.growth:+.1f} p/m2/min)"
+            hold = 2.0 if (status >= 2 or heading) else 4.0
+            if inc["confirm_since"] is not None and t - inc["confirm_since"] >= hold:
+                why = ("HIGH confirmed" if status >= 2 else
+                       f"heading for {pred:.1f} p/m2 in {PRED_H}s" if heading else
+                       f"area filling up ({z.growth:+.1f} p/m2/min)")
                 escalate(1, f"{why} (C={z.score:.0f}, {z.rho:.1f} p/m2) - red spotlight marks the area")
-        elif level == 1 and ((status >= 2 and t - since >= 8.0) or critical):
-            self._announce(crowd_map, inc, t, escalate, critical)
+        elif level == 1 and ((status >= 2 and t - since >= 8.0) or critical or
+                             (pred is not None and pred >= PRED_ANNOUNCE and t - since >= 3.0)):
+            self._announce(crowd_map, inc, t, escalate, critical,
+                           heading=None if (status >= 2 and t - since >= 8.0) or critical else pred)
         elif level >= 2:
-            if level == 2 and ((status >= 2 and t - since >= 15.0) or
-                               (inc["critical_since"] is not None and t - inc["critical_since"] >= 5.0
-                                and t - since >= 10.0)):
-                escalate(3, f"still {'CRITICAL' if critical else 'HIGH'} after announcement "
-                            "- SECURITY TEAM ALERTED (notification)")
+            if level == 2 and not improving and (
+                    (status >= 2 and t - since >= 20.0) or
+                    (inc["critical_since"] is not None and t - inc["critical_since"] >= 5.0
+                     and t - since >= 15.0)):
+                escalate(3, f"still {'CRITICAL' if critical else 'HIGH'} and not improving after "
+                            "the announcement - SECURITY TEAM ALERTED (notification)")
                 self.security_alert = True
-            if (status >= 2 and t - inc["last_announce"] >= 15.0
+            repeat_after = 15.0 if improving else 10.0
+            if (status >= 2 and t - inc["last_announce"] >= repeat_after
                     and inc["announcements"] < MAX_ANNOUNCEMENTS):
                 self._announce(crowd_map, inc, t, escalate, critical, repeat=True)
 
@@ -198,7 +234,7 @@ class FleetCoordinator:
         else:
             inc["calm_since"] = None
 
-    def _announce(self, crowd_map, inc, t, escalate, critical, repeat=False):
+    def _announce(self, crowd_map, inc, t, escalate, critical, repeat=False, heading=None):
         relief = self._choose_relief(crowd_map, t, inc["xy"])
         inc["announcements"] = inc.get("announcements", 0) + 1
         inc["last_announce"] = t
@@ -210,6 +246,8 @@ class FleetCoordinator:
         if repeat:
             self.log(t, f"ANNOUNCE #{inc['announcements']}: {msg}")
         else:
-            escalate(2, ("CRITICAL - " if critical else "still HIGH - ") + msg)
+            lead = ("CRITICAL - " if critical else
+                    f"heading for {heading:.1f} p/m2 - " if heading is not None else "still HIGH - ")
+            escalate(2, lead + msg)
         self.pending_announcement = {"drone": inc["responder"], "hotspot": inc["xy"].copy(),
                                      "relief": relief}

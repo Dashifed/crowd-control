@@ -17,6 +17,14 @@ Per zone, from camera-derived tracks only:
     C = 100 * (0.25 C_rho + 0.20 C_v + 0.20 C_g + 0.15 C_s + 0.10 C_d + 0.10 C_p)
 Unavailable components are dropped and the remaining weights renormalised.
 
+Prediction, two signals, the higher one wins:
+  * trend (brief section 3.4): least squares on the zone's smoothed density over the last
+    30 s (needs >= 3 samples spanning >= 10 s), projected +10/+20/+30 s ahead;
+  * inflow: tracked people within 8 m who are walking towards the zone and would reach it
+    within the horizon, added to the people already there. A wave of fans heading for the
+    stage shows up here seconds before the density itself rises.
+Both are short-horizon estimates, not forecasts of how a crowd will behave.
+
 Freshness: <= 2 s fresh, <= 5 s stale, older = unknown. Unknown is NOT zero.
 
 ADAPTATIONS (deliberate, for a standing concert audience rather than walking flows):
@@ -39,6 +47,8 @@ WIN = 2.0
 V_REF = 1.2
 FRESH_S, STALE_S = 2.0, 5.0
 STATUS_NAMES = ["NORMAL", "DEVELOPING", "HIGH", "CRITICAL"]
+PRED_WINDOW_S = 30.0
+PRED_HORIZONS = (10, 20, 30)
 WEIGHTS = {"rho": 0.25, "v": 0.20, "g": 0.20, "s": 0.15, "d": 0.10, "p": 0.10}
 
 
@@ -67,7 +77,10 @@ class Zone:
         self.score = None
         self.status = None
         self.last_seen = -np.inf
-        self.history = []                 # (t, rho_smoothed)
+        self.history = []                 # (t, rho_smoothed), last 30 s
+        self.pred = None                  # {10: rho, 20: rho, 30: rho} or None
+        self.inbound = 0                  # people currently heading into this zone
+        self.change5 = None               # density change over the last ~5 s
         self.pre_since = None             # time C_pre first went >= 25
         self.override_since = None
         self.critical_override = False
@@ -92,6 +105,7 @@ class FleetCrowdMap:
             for tr in obs["tracks"]:
                 tr.slow_updates = tr.slow_updates + 1 if tr.speed < 0.2 else 0
 
+        movers = self._movers(observations)
         for z in self.zones:
             best = None
             for obs in observations:
@@ -102,10 +116,20 @@ class FleetCrowdMap:
                     if best is None or key > best[0]:
                         best = (key, obs, vis)
             if best is not None:
-                self._measure(z, t, best[1], best[2])
+                self._measure(z, t, best[1], best[2], movers)
             self._refresh_status(z, t)
 
-    def _measure(self, z, t, obs, vis_area):
+    @staticmethod
+    def _movers(observations, min_speed=0.4):
+        """Moving tracks from all drones, de-duplicated where both drones see the same person."""
+        out = []
+        for obs in observations:
+            for tr in obs["tracks"]:
+                if tr.speed >= min_speed and all(np.linalg.norm(tr.pos - p) > 0.3 for p, _ in out):
+                    out.append((tr.pos.copy(), tr.vel.copy()))
+        return out
+
+    def _measure(self, z, t, obs, vis_area, movers=()):
         x0, x1, y0, y1 = z.rect
         inside = [tr for tr in obs["tracks"] if x0 <= tr.pos[0] < x1 and y0 <= tr.pos[1] < y1]
         z.n_tracks = len(inside)
@@ -122,11 +146,43 @@ class FleetCrowdMap:
         z.disp = ema(1.0 - float(np.linalg.norm(np.mean(moving, axis=0))), z.disp) if len(moving) >= 5 else None
 
         z.history.append((t, z.rho))
-        z.history = [(ht, hr) for ht, hr in z.history if t - ht <= 12.0]
+        z.history = [(ht, hr) for ht, hr in z.history if t - ht <= PRED_WINDOW_S]
         past = [hr for ht, hr in z.history if 9.0 <= t - ht <= 11.0]
         z.growth = 6.0 * (z.rho - past[0]) if past else None
+        recent = [hr for ht, hr in z.history if 4.0 <= t - ht <= 6.0]
+        z.change5 = z.rho - recent[0] if recent else None
+        z.pred = self._predict(z, t)
+
+        # Inflow: people walking towards this zone who would arrive within each horizon.
+        x0, x1, y0, y1 = z.rect
+        etas = []
+        for p, v in movers:
+            if x0 <= p[0] < x1 and y0 <= p[1] < y1:
+                continue
+            to_z = z.c - p
+            dist = float(np.linalg.norm(to_z))
+            if dist > 8.0:
+                continue
+            speed = float(np.linalg.norm(v))
+            if np.dot(to_z / dist, v / speed) > 0.9:          # heading at the zone
+                etas.append(max(0.0, dist - WIN / 2) / speed)
+        z.inbound = sum(1 for e in etas if e <= 10.0)
+        flow = {h: (len(inside) + sum(1 for e in etas if e <= h)) / vis_area for h in PRED_HORIZONS}
+        z.pred = flow if z.pred is None else {h: max(z.pred[h], flow[h]) for h in PRED_HORIZONS}
         z.last_seen = t
         self._score(z, t)
+
+    @staticmethod
+    def _predict(z, t):
+        """Linear trend of smoothed density over the last 30 s, projected ahead."""
+        if len(z.history) < 3:
+            return None
+        ts = np.array([ht - t for ht, _ in z.history])
+        rs = np.array([hr for _, hr in z.history])
+        if ts.max() - ts.min() < 10.0:
+            return None
+        slope, intercept = np.polyfit(ts, rs, 1)
+        return {h: float(max(0.0, intercept + slope * h)) for h in PRED_HORIZONS}
 
     def _score(self, z, t):
         gate = clamp01((z.rho - 2.0) / 1.5)

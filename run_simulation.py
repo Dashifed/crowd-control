@@ -128,6 +128,8 @@ def draw_panel(crowd_map, coordinator, t, drone_pos, beacon):
         lines = [f"zone ({z.c[0]:+.0f},{z.c[1]:+.0f}) {STATUS_NAMES[z.status]}  C={z.score:.0f}",
                  f"density {z.rho:.2f} p/m2   growth {fmt(z.growth, '{:+.2f}')} /min",
                  f"speed {fmt(z.speed, '{:.2f}')} m/s   stopped {fmt(z.p_stop, '{:.0%}')}",
+                 f"trend +10/+20/+30s: " + ("n/a" if z.pred is None else
+                     " / ".join(f"{z.pred[h]:.1f}" for h in (10, 20, 30)) + " p/m2"),
                  f"data: {crowd_map.freshness(z, t)}"]
         for k, line in enumerate(lines):
             put(panel, line, (mx + 175, 44 + k * 22), 0.4, (210, 210, 220))
