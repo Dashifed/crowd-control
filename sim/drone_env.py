@@ -1,263 +1,289 @@
 """
-Simulation Environment for Autonomous Crowd-Density Dispersion & Coordinated Fleet.
-Loads `config/arena.xml` and manages pedestrian social-force dynamics, unscripted crowd surges,
-and active drone red-beacon dispersion physics.
+MuJoCo simulation environment for the CrowdFlow stage-front scenario.
+
+What this module owns:
+  * The physical world (config/arena.xml): 100 pedestrians, 2 mocap drones, stage, bar.
+  * The crowd behaviour model: social-force-style steering written as velocity commands.
+  * How people RESPOND to the drones' outputs (spotlight, announcement). The drones never
+    move people directly; they only change what people know, and people decide.
+  * Offline evaluation helpers (prefixed `gt_`). These read simulator ground truth and must
+    never be passed to the drone brain; they exist only to score a run afterwards.
+
+Scenario: the show starts and fans drift towards the centre of the stage barrier at their
+own (random) times. Nobody is scripted to crush; congestion emerges because many people
+want the same few square metres. Without intervention, the stage-front centre compresses.
 """
 
 import os
 import numpy as np
 import mujoco
 
+# Venue geometry (must match config/generate_arena.py)
+VENUE_X = 10.0
+VENUE_Y = 7.5
+BARRIER_X = -8.4
+PED_RADIUS = 0.22
+
+# Pedestrian roles
+FAN, CASUAL, MOBILE = 0, 1, 2
+
+# Response to drone outputs
+SPOTLIGHT_RADIUS = 2.0      # m, ground footprint of the spotlight
+AUDIBLE_FULL = 10.0         # m, announcement fully audible within this range
+AUDIBLE_ZERO = 30.0         # m, inaudible beyond this range
+
 
 class CrowdFleetEnv:
-    """MuJoCo Simulation Environment for the 2-Drone Crowd Safety Fleet."""
+    """MuJoCo environment: 100-person concert floor patrolled by drones Alpha and Bravo."""
 
-    def __init__(self, xml_path: str = None, frame_width: int = 640, frame_height: int = 480):
+    DRONES = ("alpha", "bravo")
+
+    def __init__(self, xml_path: str = None, frame_width: int = 640, frame_height: int = 480,
+                 seed: int = 2026, render: bool = True):
         if xml_path is None:
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             xml_path = os.path.join(base_dir, "config", "arena.xml")
-
         if not os.path.exists(xml_path):
-            raise FileNotFoundError(f"MJCF Arena XML not found at: {xml_path}")
+            raise FileNotFoundError(f"MJCF arena not found at {xml_path}. "
+                                    "Run `python config/generate_arena.py` first.")
 
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
         self.frame_width = frame_width
         self.frame_height = frame_height
-        self.renderer = mujoco.Renderer(self.model, height=frame_height, width=frame_width)
-
-        self.num_pedestrians = 18
+        self.renderer = mujoco.Renderer(self.model, height=frame_height, width=frame_width) if render else None
         self.sim_dt = self.model.opt.timestep
-        self.rng = np.random.default_rng(2026)
+        self.rng = np.random.default_rng(seed)
 
-        # Resolve Mocap IDs for both drones and ground beacon rings
-        self.alpha_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "drone_alpha")
-        self.bravo_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "drone_bravo")
-        self.alpha_mocap_id = self.model.body_mocapid[self.alpha_body_id]
-        self.bravo_mocap_id = self.model.body_mocapid[self.bravo_body_id]
+        # --- Drones, spotlights, ground rings ---
+        self.drone_mocap, self.disc_mocap, self.bulb_geom = {}, {}, {}
+        for d in self.DRONES:
+            body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"drone_{d}")
+            disc = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"beacon_disc_{d}")
+            self.drone_mocap[d] = self.model.body_mocapid[body]
+            self.disc_mocap[d] = self.model.body_mocapid[disc]
+            self.bulb_geom[d] = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{d}_beacon_bulb")
+        self.beacon_active = {d: False for d in self.DRONES}
 
-        disc_a_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "beacon_disc_alpha")
-        disc_b_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "beacon_disc_bravo")
-        self.disc_alpha_mocap_id = self.model.body_mocapid[disc_a_body]
-        self.disc_bravo_mocap_id = self.model.body_mocapid[disc_b_body]
+        # --- Pedestrians ---
+        n = 0
+        while mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"ped_{n}") >= 0:
+            n += 1
+        self.num_pedestrians = n
+        self.qpos_idx = np.zeros((n, 2), dtype=int)
+        self.qvel_idx = np.zeros((n, 2), dtype=int)
+        for i in range(n):
+            for k, ax in enumerate("xy"):
+                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"ped_{i}_j{ax}")
+                self.qpos_idx[i, k] = self.model.jnt_qposadr[jid]
+                self.qvel_idx[i, k] = self.model.jnt_dofadr[jid]
 
-        # Resolve Spotlight & Visual Cone IDs
-        self.light_alpha_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_LIGHT, "light_alpha")
-        self.light_bravo_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_LIGHT, "light_bravo")
+        self._init_crowd()
+        self._control_counter = 0
+        self.announcements = []     # log of (time, relief_points)
 
-        self.alpha_bulb_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "alpha_beacon_bulb")
-        self.alpha_cone_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "alpha_beam_cone")
-        self.bravo_bulb_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "bravo_beacon_bulb")
-        self.bravo_cone_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "bravo_beam_cone")
+    # ------------------------------------------------------------------ crowd setup
+    def _init_crowd(self):
+        n, rng = self.num_pedestrians, self.rng
+        # Roles: 60 fans (want the stage-front centre), 28 casual, 12 moving to/from the bar.
+        self.role = np.array([FAN] * 60 + [CASUAL] * 28 + [MOBILE] * (n - 88))[:n]
+        rng.shuffle(self.role)
 
-        # Cache Pedestrian Joint & Actuator Addresses
-        self.ped_qpos_addrs = []
-        self.ped_qvel_addrs = []
-        self.ped_body_ids = []
-        for i in range(self.num_pedestrians):
-            jx_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"ped_{i}_jx")
-            jy_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"ped_{i}_jy")
-            self.ped_qpos_addrs.append((self.model.jnt_qposadr[jx_id], self.model.jnt_qposadr[jy_id]))
-            self.ped_qvel_addrs.append((self.model.jnt_dofadr[jx_id], self.model.jnt_dofadr[jy_id]))
-            self.ped_body_ids.append(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"ped_{i}"))
+        # Non-overlapping random start positions across the floor (people arriving/milling).
+        pos = []
+        while len(pos) < n:
+            p = np.array([rng.uniform(-6.5, 8.3), rng.uniform(-7.0, 7.0)])
+            if all(np.linalg.norm(p - q) > 0.95 for q in pos):
+                pos.append(p)
+        pos = np.array(pos)
+        for i in range(n):
+            self.data.qpos[self.qpos_idx[i, 0]] = pos[i, 0]
+            self.data.qpos[self.qpos_idx[i, 1]] = pos[i, 1]
 
-        # Beacon & Surge State
-        self.beacon_active = {"alpha": False, "bravo": False}
-        self.surge_active = False
-        self.surge_epicenter = np.array([-1.35, 0.15])  # Sector 1 bottleneck crush epicenter
-        self.dispersion_radius = 2.65                   # Ground radius R of repulsive beacon
+        self.home = pos.copy()                    # casual "spot" on the floor
+        self.target = pos.copy()
+        self.speed = rng.uniform(0.9, 1.3, n)     # preferred walking speed (m/s)
 
-        # Assign nominal wandering waypoints across Sector 1 (West) and Sector 2 (East)
-        self.nominal_goals = np.zeros((self.num_pedestrians, 2))
-        self._initialize_crowd_positions()
+        # Fans: when they decide to go forward, and where along the barrier they aim.
+        self.fan_start = rng.uniform(3.0, 35.0, n)
+        self.fan_aim = np.stack([np.full(n, BARRIER_X + 0.35),
+                                 np.clip(rng.normal(0.0, 1.1, n), -5.0, 5.0)], axis=1)
+        # Mobile: alternate between the bar and a random floor spot.
+        self.next_switch = rng.uniform(5.0, 25.0, n)
+        self.at_bar_leg = rng.random(n) < 0.5
 
-    def _initialize_crowd_positions(self):
-        """
-        Positions pedestrians around Sector 1 and Sector 2 at well-spaced intervals (~2.2m apart)
-        so initial density is strictly NOMINAL (1-2 peds per cell), while close enough to form
-        a massive 14-person crowd crush within 3 seconds when `trigger_surge()` is called.
-        """
-        ring_angles = np.linspace(0, 2.0 * np.pi, 14, endpoint=False)
-        for i in range(self.num_pedestrians):
-            jx_adr, jy_adr = self.ped_qpos_addrs[i]
-            if i < 14:
-                # Ring of 14 pedestrians around the Sector 1 bottleneck (-1.4, 0.0) at radius 2.5m - 3.3m
-                r = 2.55 + (i % 2) * 0.70
-                ang = ring_angles[i]
-                px = -1.40 + r * np.cos(ang)
-                py = 0.0 + r * np.sin(ang)
-                px = np.clip(px, -3.3, 2.2)
-                py = np.clip(py, -3.8, 3.8)
-            else:
-                # 4 pedestrians in East Sector 2 under Drone Bravo
-                sec2_coords = [(2.4, 2.0), (2.4, -2.0), (3.8, 1.2), (3.8, -1.2)]
-                px, py = sec2_coords[i - 14]
+        # Behavioural response parameters (stylised; NOT a validated human-compliance model)
+        self.responsiveness = rng.uniform(0.35, 0.90, n)
+        self.reaction_delay = rng.uniform(1.0, 8.0, n)
+        self.holding = np.zeros(n, dtype=bool)        # stopped pushing forward (noticed spotlight)
+        self.hold_at = np.full(n, np.inf)             # time the hold takes effect
+        self.spot_seen = np.zeros(n, dtype=bool)      # already drew a response to the spotlight
+        self.relocate_at = np.full(n, np.inf)         # time a relocation takes effect
+        self.relocate_to = np.zeros((n, 2))
+        self.relocated = np.zeros(n, dtype=bool)
 
-            self.data.qpos[jx_adr] = px
-            self.data.qpos[jy_adr] = py
-            self.nominal_goals[i] = np.array([px, py])
-
-        self.set_beacon("alpha", False)
-        self.set_beacon("bravo", False)
+        for d in self.DRONES:
+            self.set_beacon(d, False)
         mujoco.mj_forward(self.model, self.data)
 
-    def trigger_surge(self, active: bool = True):
-        """
-        Triggers or clears an unscripted crowd surge toward the Sector 1 stage bottleneck,
-        causing pedestrians to pack into a high-density crush cluster.
-        """
-        self.surge_active = active
-
+    # ------------------------------------------------------------------ drone outputs
     def set_beacon(self, drone_id: str, active: bool):
+        """Turns a drone's red spotlight and its ground ring on/off (informational only)."""
+        d = drone_id.lower()
+        self.beacon_active[d] = bool(active)
+        bulb = self.bulb_geom[d]
+        # Shown as a red bulb on the drone and a red ring on the floor (see generate_arena.py)
+        self.model.geom_rgba[bulb] = [1.0, 0.0, 0.0, 1.0] if active else [0.2, 0.2, 0.2, 0.5]
+        self._place_disc(d)
+
+    def _place_disc(self, d):
+        p = self.data.mocap_pos[self.drone_mocap[d]]
+        z = 0.008 if self.beacon_active[d] else -2.0
+        self.data.mocap_pos[self.disc_mocap[d]] = [p[0], p[1], z]
+
+    def announce(self, drone_id: str, hotspot_xy, relief_points, address_radius: float = 5.0):
         """
-        Toggles the drone's downward RED WARNING BEACON spotlight and ground projection ring.
-        drone_id: 'alpha' or 'bravo'
+        Plays a pre-recorded announcement from a drone: "Please make space at the front -
+        move to the side areas of the stage." Each person near the hotspot (or a fan still
+        heading for it) independently decides whether to comply, based on responsiveness
+        and audibility, after a personal reaction delay.
         """
-        key = drone_id.lower()
-        self.beacon_active[key] = bool(active)
+        t = self.data.time
+        pos = self.get_pedestrian_positions()
+        drone_xy = self.data.mocap_pos[self.drone_mocap[drone_id]][:2]
+        relief = np.asarray(relief_points, dtype=float).reshape(-1, 2)
+        self.announcements.append((t, relief.copy()))
 
-        if key == "alpha":
-            light_id = self.light_alpha_id
-            bulb_id = self.alpha_bulb_geom
-            cone_id = self.alpha_cone_geom
-            disc_mocap = self.disc_alpha_mocap_id
-            drone_pos = self.data.mocap_pos[self.alpha_mocap_id]
-        elif key == "bravo":
-            light_id = self.light_bravo_id
-            bulb_id = self.bravo_bulb_geom
-            cone_id = self.bravo_cone_geom
-            disc_mocap = self.disc_bravo_mocap_id
-            drone_pos = self.data.mocap_pos[self.bravo_mocap_id]
-        else:
-            raise ValueError(f"Unknown drone_id '{drone_id}'. Expected 'alpha' or 'bravo'.")
+        dist_drone = np.linalg.norm(pos - drone_xy, axis=1)
+        audibility = np.clip((AUDIBLE_ZERO - dist_drone) / (AUDIBLE_ZERO - AUDIBLE_FULL), 0.0, 1.0)
+        near_hotspot = np.linalg.norm(pos - np.asarray(hotspot_xy), axis=1) < address_radius
+        fan_inbound = (self.role == FAN) & ~self.relocated
+        addressed = (near_hotspot | fan_inbound) & ~self.relocated & np.isinf(self.relocate_at)
+        comply = addressed & (self.rng.random(self.num_pedestrians) < self.responsiveness * audibility)
 
-        if active:
-            # Bright RED spotlight [1.0, 0.0, 0.0] and visible translucent beam + ground ring
-            self.model.light_diffuse[light_id] = np.array([1.0, 0.0, 0.0])
-            self.model.light_specular[light_id] = np.array([0.8, 0.1, 0.1])
-            self.model.geom_rgba[bulb_id] = np.array([1.0, 0.0, 0.0, 1.0])
-            self.model.geom_rgba[cone_id] = np.array([1.0, 0.05, 0.05, 0.22])
-            self.data.mocap_pos[disc_mocap] = np.array([drone_pos[0], drone_pos[1], 0.008])
-        else:
-            # Dim/Off spotlight and hide ground projection disc beneath floor
-            self.model.light_diffuse[light_id] = np.array([0.05, 0.05, 0.05])
-            self.model.light_specular[light_id] = np.array([0.0, 0.0, 0.0])
-            self.model.geom_rgba[bulb_id] = np.array([0.2, 0.2, 0.2, 0.5])
-            self.model.geom_rgba[cone_id] = np.array([1.0, 0.0, 0.0, 0.0])
-            self.data.mocap_pos[disc_mocap] = np.array([drone_pos[0], drone_pos[1], -2.0])
+        for i in np.flatnonzero(comply):
+            if len(relief) == 0:               # "please stop pushing forward"
+                self.hold_at[i] = min(self.hold_at[i], t + self.reaction_delay[i])
+                continue
+            nearest = relief[np.argmin(np.linalg.norm(relief - pos[i], axis=1))]
+            self.relocate_to[i] = nearest + self.rng.normal(0.0, 0.8, 2)
+            self.relocate_at[i] = t + self.reaction_delay[i]
+        return int(comply.sum())
 
+    # ------------------------------------------------------------------ state access
     def get_pedestrian_positions(self) -> np.ndarray:
-        """Returns (N, 2) array of current (x, y) world coordinates for all pedestrians."""
-        coords = np.zeros((self.num_pedestrians, 2))
-        for i, body_id in enumerate(self.ped_body_ids):
-            coords[i, 0] = self.data.xpos[body_id, 0]
-            coords[i, 1] = self.data.xpos[body_id, 1]
-        return coords
+        return self.data.qpos[self.qpos_idx].copy()
 
-    def _compute_crowd_controls(self, alpha_pos: np.ndarray, bravo_pos: np.ndarray):
-        """
-        Computes velocity-steering actuator commands for each pedestrian:
-          1. Nominal patrol wandering around arena center OR aggressive surge toward bottleneck.
-          2. Active radial dispersion away from any drone projecting an active RED warning beacon.
-          3. Social repulsion between pedestrians (reduced during a crush surge to create realistic clustering).
-        """
-        positions = self.get_pedestrian_positions()
-        sim_t = self.data.time
+    def get_pedestrian_velocities(self) -> np.ndarray:
+        return self.data.qvel[self.qvel_idx].copy()
 
-        # If a drone's dispersion beacon is active over the surge zone, it breaks the surge!
-        alpha_dispersing = self.beacon_active["alpha"]
-        bravo_dispersing = self.beacon_active["bravo"]
+    # ------------------------------------------------------------------ behaviour model
+    def _update_intentions(self, pos):
+        t, rng = self.data.time, self.rng
 
-        for i in range(self.num_pedestrians):
-            pos = positions[i]
-            ctrl_vec = np.zeros(2)
+        # Spotlight: people inside the lit circle may notice it and stop pushing forward.
+        for d in self.DRONES:
+            if not self.beacon_active[d]:
+                continue
+            c = self.data.mocap_pos[self.drone_mocap[d]][:2]
+            inside = np.linalg.norm(pos - c, axis=1) < SPOTLIGHT_RADIUS
+            new = inside & ~self.spot_seen
+            self.spot_seen |= new
+            notice = new & (rng.random(self.num_pedestrians) < self.responsiveness)
+            self.hold_at[notice] = t + self.reaction_delay[notice]
+        hold_now = (self.hold_at <= t) & ~self.holding
+        self.holding |= hold_now
+        self.target[hold_now] = pos[hold_now]
 
-            # --- 1. Active Drone Beacon Dispersion (Smooth Outward Walk, No Panic/Jitter) ---
-            under_active_beacon = False
-            for is_active, d_pos in ((alpha_dispersing, alpha_pos), (bravo_dispersing, bravo_pos)):
-                if is_active:
-                    beam_xy = d_pos[:2]
-                    away_vec = pos - beam_xy
-                    dist_beam = np.linalg.norm(away_vec)
-                    if dist_beam < self.dispersion_radius:
-                        under_active_beacon = True
-                        # Walk calmly outward toward assigned dispersed home position
-                        to_home = self.nominal_goals[i] - pos
-                        dist_home = np.linalg.norm(to_home)
-                        if dist_home > 0.25:
-                            unit_out = to_home / dist_home
-                        elif dist_beam > 1e-3:
-                            unit_out = away_vec / dist_beam
-                        else:
-                            angle = (2.0 * np.pi * i) / self.num_pedestrians
-                            unit_out = np.array([np.cos(angle), np.sin(angle)])
-                        # Smooth, steady walking speed (max 1.45 m/s effort) so they never panic or jitter
-                        ctrl_vec = unit_out * min(1.45, 0.45 + 0.55 * dist_home)
+        # Announcements take effect after each person's reaction delay.
+        move_now = (self.relocate_at <= t) & ~self.relocated
+        self.relocated |= move_now
+        self.target[move_now] = self.relocate_to[move_now]
 
-            # --- 2. Surge vs. Nominal Circulation (when not actively dispersing under beam) ---
-            if not under_active_beacon:
-                if self.surge_active and i < 14:
-                    # 14 pedestrians converge steadily into a tight 14-person crowd at the stage bottleneck
-                    to_epi = self.surge_epicenter - pos
-                    dist_epi = np.linalg.norm(to_epi) + 1e-6
-                    ctrl_vec += (to_epi / dist_epi) * min(1.85, dist_epi * 1.45)
-                else:
-                    # Gentle, calm strolling around well-spaced nominal stations
-                    phase = sim_t * 0.35 + i * 0.85
-                    wander_offset = np.array([0.28 * np.cos(phase), 0.28 * np.sin(phase * 0.9)])
-                    target = self.nominal_goals[i] + wander_offset
-                    to_target = target - pos
-                    dist_t = np.linalg.norm(to_target) + 1e-6
-                    ctrl_vec += (to_target / dist_t) * min(1.10, dist_t * 0.90)
+        free = ~self.holding & ~self.relocated
+        fans = free & (self.role == FAN) & (t >= self.fan_start)
+        self.target[fans] = self.fan_aim[fans]
 
-            # --- 3. Smooth Pedestrian-to-Pedestrian Social Spacing ---
-            if not (self.surge_active and not alpha_dispersing):
-                for j in range(self.num_pedestrians):
-                    if i == j:
-                        continue
-                    diff = pos - positions[j]
-                    d = np.linalg.norm(diff)
-                    if 1e-4 < d < 0.72:
-                        ctrl_vec += (diff / d) * (0.65 * (0.72 - d))
+        casual = free & (self.role == CASUAL)
+        phase = t * 0.3 + np.arange(self.num_pedestrians) * 0.85
+        wander = 0.3 * np.stack([np.cos(phase), np.sin(0.9 * phase)], axis=1)
+        self.target[casual] = self.home[casual] + wander[casual]
+        fans_waiting = free & (self.role == FAN) & (t < self.fan_start)
+        self.target[fans_waiting] = self.home[fans_waiting] + wander[fans_waiting]
 
-            # --- 4. Soft Boundary Keep-Out from Bottleneck Walls ---
-            if pos[0] < -3.2:
-                ctrl_vec[0] += 1.2 * (-3.2 - pos[0])
-            elif pos[0] > 5.2:
-                ctrl_vec[0] -= 1.2 * (pos[0] - 5.2)
-            if abs(pos[1]) > 4.2:
-                ctrl_vec[1] -= np.sign(pos[1]) * 1.2 * (abs(pos[1]) - 4.2)
+        mobile = free & (self.role == MOBILE)
+        switch = mobile & (t >= self.next_switch)
+        for i in np.flatnonzero(switch):
+            self.at_bar_leg[i] = not self.at_bar_leg[i]
+            self.next_switch[i] = t + rng.uniform(12.0, 30.0)
+            if self.at_bar_leg[i]:
+                self.target[i] = [8.6, rng.uniform(-2.6, 2.6)]
+            else:
+                self.target[i] = [rng.uniform(-4.0, 7.0), rng.uniform(-6.5, 6.5)]
 
-            # Write smooth velocity commands to 2-DOF slide actuators
-            self.data.ctrl[2 * i] = np.clip(ctrl_vec[0], -2.0, 2.0)
-            self.data.ctrl[2 * i + 1] = np.clip(ctrl_vec[1], -2.0, 2.0)
+    def _compute_crowd_controls(self):
+        pos = self.get_pedestrian_positions()
+        self._update_intentions(pos)
 
-    def step(self, alpha_pos: np.ndarray, bravo_pos: np.ndarray, substeps: int = 1):
-        """
-        Updates drone mocap positions, sincronizes ground beacon projections,
-        and steps the MuJoCo physics simulation by `substeps`.
-        """
-        alpha_pos = np.asarray(alpha_pos, dtype=np.float64)
-        bravo_pos = np.asarray(bravo_pos, dtype=np.float64)
+        # People relocating after an announcement don't squeeze into a crowd: once they are
+        # near their destination and it is already busy around them, they stop where they are.
+        diff = pos[:, None, :] - pos[None, :, :]
+        d = np.linalg.norm(diff, axis=2) + np.eye(self.num_pedestrians)
+        neighbours = (d < 1.0).sum(axis=1)
+        settle = (self.relocated & (neighbours >= 4)
+                  & (np.linalg.norm(self.target - pos, axis=1) < 2.5))
+        self.target[settle] = pos[settle]
 
-        self.data.mocap_pos[self.alpha_mocap_id] = alpha_pos
-        self.data.mocap_pos[self.bravo_mocap_id] = bravo_pos
+        to_t = self.target - pos
+        dist = np.linalg.norm(to_t, axis=1, keepdims=True) + 1e-9
+        # Fans pressing for the barrier keep pushing; everyone else slows down on arrival.
+        pressing = ((self.role == FAN) & ~self.holding & ~self.relocated
+                    & (self.data.time >= self.fan_start))[:, None]
+        approach = np.where(pressing, 1.0, np.clip(dist / 0.6, 0.0, 1.0))
+        v_des = (to_t / dist) * self.speed[:, None] * approach
 
-        # Keep ground projection discs aligned directly beneath active drones
-        if self.beacon_active["alpha"]:
-            self.data.mocap_pos[self.disc_alpha_mocap_id] = np.array([alpha_pos[0], alpha_pos[1], 0.008])
-        if self.beacon_active["bravo"]:
-            self.data.mocap_pos[self.disc_bravo_mocap_id] = np.array([bravo_pos[0], bravo_pos[1], 0.008])
+        # Personal-space repulsion (fans pressing forward tolerate much less space).
+        overlap = np.clip(0.85 - d, 0.0, None)
+        np.fill_diagonal(overlap, 0.0)
+        push = ((diff / d[..., None]) * overlap[..., None]).sum(axis=1)
+        weight = np.where(pressing[:, 0], 0.25, 1.2)[:, None]
+        v_des += weight * push
 
+        # Soft keep-out from walls, bar and barrier.
+        v_des[:, 0] += np.clip((BARRIER_X + 0.3) - pos[:, 0], 0, None) * 1.5
+        v_des[:, 0] -= np.clip(pos[:, 0] - (VENUE_X - 1.3), 0, None) * 1.5
+        v_des[:, 1] -= np.sign(pos[:, 1]) * np.clip(np.abs(pos[:, 1]) - (VENUE_Y - 0.4), 0, None) * 1.5
+
+        self.data.ctrl[: 2 * self.num_pedestrians] = np.clip(v_des, -2.0, 2.0).reshape(-1)
+
+    # ------------------------------------------------------------------ stepping/rendering
+    def step(self, drone_positions: dict, substeps: int = 1):
+        """Moves drones to their commanded setpoints and advances physics by `substeps`."""
+        for d, p in drone_positions.items():
+            self.data.mocap_pos[self.drone_mocap[d]] = np.asarray(p, dtype=np.float64)
+            self._place_disc(d)
         for _ in range(substeps):
-            self._compute_crowd_controls(alpha_pos, bravo_pos)
+            if self._control_counter % 2 == 0:      # crowd steering at 100 Hz
+                self._compute_crowd_controls()
+            self._control_counter += 1
             mujoco.mj_step(self.model, self.data)
 
     def render_camera(self, cam_name: str) -> np.ndarray:
-        """Renders and returns an RGB uint8 numpy array (H, W, 3) from the specified camera."""
         self.renderer.update_scene(self.data, camera=cam_name)
         return self.renderer.render().copy()
 
     def close(self):
-        """Releases offscreen OpenGL rendering resources."""
-        self.renderer.close()
+        if self.renderer is not None:
+            self.renderer.close()
+
+    # ------------------------------------------------------------------ OFFLINE EVALUATION ONLY
+    def gt_peak_local_density(self, radius: float = 1.0):
+        """
+        Ground-truth peak density (people/m2) in any circle of `radius` centred on a person,
+        plus where it occurs. Evaluation only - never feed this to the drones.
+        """
+        pos = self.get_pedestrian_positions()
+        d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=2)
+        counts = (d < radius).sum(axis=1)
+        i = int(np.argmax(counts))
+        return counts[i] / (np.pi * radius ** 2), pos[i]

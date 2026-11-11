@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.mp4
+run_summary.json
+baseline.json
+.DS_Store
+results/runs/
+results/sbs_*.json
+results/test.json
